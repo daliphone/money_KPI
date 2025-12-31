@@ -73,10 +73,30 @@ def get_drive_service():
     return build('drive', 'v3', credentials=creds)
 
 def get_file_id_in_folder(service, filename, folder_id):
-    query = f"name = '{filename}' and '{folder_id}' in parents and trashed = false"
-    results = service.files().list(q=query, fields="files(id, name)").execute()
+    """
+    修正版：嘗試全域搜尋檔案，不限制在特定資料夾 ID 內。
+    解決檔案放在子資料夾 (如 202512) 導致找不到的問題。
+    """
+    # 舊寫法 (只搜特定資料夾)： f"name = '{filename}' and '{folder_id}' in parents..."
+    # 新寫法 (搜全雲端硬碟)：
+    query = f"name = '{filename}' and trashed = false"
+    
+    # 執行搜尋
+    results = service.files().list(
+        q=query, 
+        fields="files(id, name, parents)", 
+        orderBy="createdTime desc" # 若有重複檔名，取最新的
+    ).execute()
+    
     items = results.get('files', [])
-    if not items: return None
+    
+    if not items:
+        return None
+        
+    # 如果找到多個同名檔案，印出警告 (方便除錯)
+    if len(items) > 1:
+        print(f"⚠️ 警告：找到 {len(items)} 個名為 {filename} 的檔案，將使用最新的一個 (ID: {items[0]['id']})")
+        
     return items[0]['id']
 
 def update_excel_drive(store, staff, date_obj, data_dict):
@@ -242,10 +262,51 @@ else:
             
             # 顯示預覽表格
             df_preview = pd.DataFrame([st.session_state.preview_data])
-            # 把日期格式修飾一下，不顯示 index
             st.dataframe(df_preview, hide_index=True)
             
             if st.session_state.preview_score > 0:
                 st.info(f"💡 預估綜合指標貢獻：{st.session_state.preview_score*100:.1f} 分")
-            else:
-                st.warning("⚠️ 注意：目前沒有輸入任何業績 (0 分)")
+
+            col_confirm, col_cancel = st.columns([1, 1])
+            
+            # --- [修正] Step 2 按鈕邏輯 ---
+            if col_confirm.button("✅ 確認無誤，立即上傳 (Step 2)", type="primary", use_container_width=True):
+                
+                # 顯示進度條，讓使用者知道程式正在跑
+                progress_text = "連線 Google Drive 中...請稍候"
+                my_bar = st.progress(0, text=progress_text)
+                
+                try:
+                    # 準備資料
+                    data_to_save = st.session_state.preview_data.copy()
+                    target_date = data_to_save.pop('日期')
+                    
+                    my_bar.progress(30, text="正在搜尋雲端檔案...")
+                    
+                    # 執行上傳
+                    result_msg = update_excel_drive(selected_store, selected_user, target_date, data_to_save)
+                    
+                    my_bar.progress(100, text="處理完成！")
+                    
+                    if "✅" in result_msg:
+                        st.success(result_msg)
+                        st.balloons()
+                        # 成功後清除暫存
+                        st.session_state.preview_data = None
+                        st.session_state.preview_score = 0
+                        time.sleep(3)
+                        st.rerun()
+                    else:
+                        # 顯示紅色錯誤，並保留預覽讓使用者重試
+                        st.error(result_msg)
+                        st.write("🔍 **故障排除建議**：")
+                        st.write("1. 請確認 Google Drive 上的 Excel 檔名是否包含年月 (例如 `2025_12_...xlsx`)")
+                        st.write("2. 請確認機器人 (Service Account) 是否有該檔案的編輯權限")
+                        
+                except Exception as e:
+                    st.error(f"❌ 發生未預期的錯誤: {str(e)}")
+            
+            # 取消按鈕
+            if col_cancel.button("❌ 有錯誤，重新填寫", use_container_width=True):
+                st.session_state.preview_data = None
+                st.rerun()
