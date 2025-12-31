@@ -1,130 +1,174 @@
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
-import plotly.express as px
-from datetime import datetime
+from datetime import datetime, date
+import calendar
 
-# --- 1. 頁面設定 ---
-st.set_page_config(page_title="東門店業績戰情室", layout="wide", page_icon="🏆")
+# --- 1. 系統設定與模擬資料庫 ---
+st.set_page_config(page_title="東門店業績管理系統", layout="wide", page_icon="📈")
 
-# 自訂 CSS 美化
-st.markdown("""
-<style>
-    .metric-card {
-        background-color: #f0f2f6;
-        padding: 15px;
-        border-radius: 10px;
-        border-left: 5px solid #ff4b4b;
+# 初始化 Session State (模擬資料庫，讓網頁重新整理後資料還在)
+# 未來這一步會換成連接 Google Sheets
+if 'db' not in st.session_state:
+    # 建立模擬的目標設定 (對應 Excel 上半部目標區)
+    st.session_state.targets = {
+        '小萬': {'毛利': 140000, '門號': 24, '保險': 28000, '配件': 35000, '庫存': 21},
+        '914':  {'毛利': 140000, '門號': 24, '保險': 28000, '配件': 35000, '庫存': 21},
+        '默默': {'毛利': 140000, '門號': 24, '保險': 28000, '配件': 35000, '庫存': 21},
+        '東門店': {'毛利': 462000, '門號': 84, '保險': 105000, '配件': 126000, '庫存': 56} # 店總目標
     }
-    .stMetric {
-        background-color: transparent !important;
-    }
-</style>
-""", unsafe_allow_html=True)
+    
+    # 建立模擬的每日業績紀錄 (對應 Excel 下半部填寫區)
+    # 格式: [日期, 毛利, 門號, 保險, 配件, 庫存]
+    st.session_state.records = pd.DataFrame(columns=['人員', '日期', '毛利', '門號', '保險', '配件', '庫存'])
 
-st.title("🏆 東門店 - 業績動能戰情室")
-st.markdown(f"**資料更新時間**: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+# --- 2. 左側導航：門市與人員選擇 ---
+st.sidebar.title("🏢 門市管理系統")
+
+# 定義組織架構
+org_structure = {
+    "台南區": {
+        "東門店": ["小萬", "914", "默默", "人員4"],
+        "西門店": ["店長A", "組員B"] # 範例，可擴充
+    }
+}
+
+# 第一層：選擇區域 (預留擴充)
+region = "台南區" 
+
+# 第二層：選擇門市
+selected_store = st.sidebar.selectbox("請選擇門市", list(org_structure[region].keys()))
+
+# 第三層：選擇人員 (包含「全店總表」選項)
+staff_list = ["全店總表"] + org_structure[region][selected_store]
+selected_user = st.sidebar.selectbox("請選擇人員", staff_list)
+
+st.sidebar.markdown("---")
+st.sidebar.info(f"目前操作身份：\n**{selected_store} - {selected_user}**")
+
+# --- 3. 頂部：資料輸入區 (針對個人) ---
+# 只有選擇「個人」時才顯示輸入框，選「全店總表」時不顯示
+if selected_user != "全店總表":
+    with st.expander("📝 **每日業績回報 (點擊展開)**", expanded=True):
+        st.write(f"正在填寫：**{selected_user}** 的業績紀錄")
+        
+        with st.form("daily_report_form"):
+            col_date, col_1, col_2, col_3, col_4, col_5 = st.columns(6)
+            
+            with col_date:
+                input_date = st.date_input("日期", date.today())
+            with col_1:
+                in_profit = st.number_input("毛利", min_value=0, step=100)
+            with col_2:
+                in_number = st.number_input("門號", min_value=0, step=1)
+            with col_3:
+                in_insur = st.number_input("保險營收", min_value=0, step=100)
+            with col_4:
+                in_acc = st.number_input("配件營收", min_value=0, step=100)
+            with col_5:
+                in_stock = st.number_input("庫存手機", min_value=0, step=1)
+            
+            submitted = st.form_submit_button("💾 提交日報表")
+            
+            if submitted:
+                # 將資料寫入 Session State (模擬存檔)
+                new_record = {
+                    '人員': selected_user,
+                    '日期': input_date,
+                    '毛利': in_profit,
+                    '門號': in_number,
+                    '保險': in_insur,
+                    '配件': in_acc,
+                    '庫存': in_stock
+                }
+                st.session_state.records = pd.concat([st.session_state.records, pd.DataFrame([new_record])], ignore_index=True)
+                st.success(f"{input_date} 業績已儲存！")
+
+# --- 4. 核心邏輯運算 (Excel 公式移植) ---
+
+# A. 取得該員(或該店)的目標
+if selected_user == "全店總表":
+    # 若選全店，目標是店總目標
+    target_data = st.session_state.targets.get(selected_store, {'毛利': 1, '門號': 1, '保險': 1, '配件': 1, '庫存': 1})
+    # 業績是所有人加總
+    filtered_records = st.session_state.records # 這裡簡化，實際應篩選該店所有人
+else:
+    # 若選個人，目標是個人目標
+    target_data = st.session_state.targets.get(selected_user, {'毛利': 1, '門號': 1, '保險': 1, '配件': 1, '庫存': 1})
+    # 業績是個人篩選
+    filtered_records = st.session_state.records[st.session_state.records['人員'] == selected_user]
+
+# B. 計算累計業績 (SUM)
+current_performance = {
+    '毛利': filtered_records['毛利'].sum() if not filtered_records.empty else 0,
+    '門號': filtered_records['門號'].sum() if not filtered_records.empty else 0,
+    '保險': filtered_records['保險'].sum() if not filtered_records.empty else 0,
+    '配件': filtered_records['配件'].sum() if not filtered_records.empty else 0,
+    '庫存': filtered_records['庫存'].sum() if not filtered_records.empty else 0,
+}
+
+# C. 計算時間參數 (對應 Excel 左上角時間區)
+today = date.today()
+last_day_of_month = calendar.monthrange(today.year, today.month)[1]
+remaining_days = last_day_of_month - today.day
+if remaining_days < 0: remaining_days = 0
+
+# --- 5. 儀表板呈現區 ---
+
+st.title(f"📊 {selected_user} - 業績動態戰情室")
 st.markdown("---")
 
-# --- 2. 讀取資料函數 ---
-@st.cache_data  # 加入快取機制，讓網頁跑更快
-def load_data():
-    # 這裡預設讀取同目錄下的 data.xlsx
-    # 在實際 Excel 中，請確保有一個總表 Sheet 或是已經合併好的結構
-    # 這裡我們模擬一個 DataFrame 結構，因為我沒有你合併後的真實檔案
-    # ★重要★：實際上線時，請把下面這段註解掉，改用 pd.read_excel('data.xlsx')
+# 定義一個顯示卡片的函式 (包含動能計算公式)
+def display_kpi(label, current, target, unit=""):
+    # 1. 達成率公式
+    achievement_rate = (current / target) * 100 if target > 0 else 0
     
-    # 模擬數據 (請用你的 pd.read_excel('data.xlsx') 取代)
-    data = {
-        '人員': ['東門店(全店)', '914', '默默', '小萬', '人員4'],
-        '毛利_目標': [462000, 140000, 140000, 140000, 42000],
-        '毛利_目前': [158000, 52000, 31000, 65000, 10000],
-        '門號_目標': [84, 24, 24, 24, 12],
-        '門號_目前': [30, 10, 5, 12, 3],
-        '生活圈_目標': [90, 25, 25, 25, 15],
-        '生活圈_目前': [45, 15, 10, 15, 5]
-    }
-    df = pd.DataFrame(data)
+    # 2. GAP (落差) 公式
+    gap = target - current
     
-    # 計算全月天數與剩餘天數 (自動化)
-    today = datetime.now()
-    # 假設目標是本月
-    import calendar
-    last_day = calendar.monthrange(today.year, today.month)[1]
-    remaining_days = last_day - today.day
-    if remaining_days < 0: remaining_days = 0 # 防止月底變成負數
+    # 3. 日動能 (Momentum) 公式： (目標 - 目前) / 剩餘天數
+    momentum = gap / remaining_days if remaining_days > 0 and gap > 0 else 0
     
-    return df, remaining_days
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        st.metric(
+            label=f"{label} (目標: {target:,})",
+            value=f"{current:,} {unit}",
+            delta=f"{achievement_rate:.1f}% 達成 (GAP: {gap:,})"
+        )
+    with col2:
+        if gap > 0:
+            st.metric(
+                label="🔥 每日需達 (動能)",
+                value=f"{int(momentum):,} {unit}",
+                delta="落後追趕中" if momentum > (target/last_day_of_month) else "進度安全",
+                delta_color="inverse"
+            )
+        else:
+             st.metric(label="✨ 狀態", value="已達標", delta="恭喜！")
+    
+    # 4. 進度條 (移植 115% 視覺化)
+    st.progress(min(achievement_rate / 115, 1.0)) # 假設 115% 是滿條
+    st.caption(f"目前達成率: {achievement_rate:.1f}% / 115% (超額激勵目標)")
 
-try:
-    # 嘗試讀取資料
-    df, remaining_days = load_data()
-except Exception as e:
-    st.error(f"資料讀取失敗，請檢查 Excel 檔案是否上傳。錯誤訊息: {e}")
-    st.stop()
+# 顯示各項指標
+kpi_col1, kpi_col2 = st.columns(2)
 
-# --- 3. 側邊欄篩選 ---
-st.sidebar.header("🔍 戰情室篩選")
-selected_user = st.sidebar.selectbox("選擇人員 / 店鋪", df['人員'])
+with kpi_col1:
+    st.subheader("💰 營收核心")
+    display_kpi("毛利", current_performance['毛利'], target_data['毛利'])
+    st.divider()
+    display_kpi("保險營收", current_performance['保險'], target_data['保險'])
 
-# 篩選該員數據
-user_data = df[df['人員'] == selected_user].iloc[0]
+with kpi_col2:
+    st.subheader("📱 件數核心")
+    display_kpi("門號數", current_performance['門號'], target_data['門號'], "件")
+    st.divider()
+    display_kpi("配件營收", current_performance['配件'], target_data['配件'])
 
-# --- 4. 核心指標區 ---
-col1, col2, col3, col4 = st.columns(4)
-
-# 計算達成率
-毛利達成率 = (user_data['毛利_目前'] / user_data['毛利_目標']) * 100
-門號達成率 = (user_data['門號_目前'] / user_data['門號_目標']) * 100
-
-# 動能計算 (動態)
-毛利缺口 = user_data['毛利_目標'] - user_data['毛利_目前']
-if 毛利缺口 < 0: 毛利缺口 = 0
-每日需達毛利 = 毛利缺口 / remaining_days if remaining_days > 0 else 毛利缺口
-
-with col1:
-    st.metric(label="💰 目前毛利", value=f"${user_data['毛利_目前']:,}", delta=f"{毛利達成率:.1f}% 達成")
-with col2:
-    st.metric(label="📱 目前門號", value=f"{user_data['門號_目前']} 件", delta=f"{門號達成率:.1f}% 達成")
-with col3:
-    st.metric(label="🔥 今日動能 (毛利)", value=f"${int(每日需達毛利):,}", delta="每日必達", delta_color="inverse")
-with col4:
-    st.metric(label="📅 本月剩餘天數", value=f"{remaining_days} 天")
-
-st.markdown("---")
-
-# --- 5. 視覺化儀表板 (Bullet Chart) ---
-st.subheader(f"📊 {selected_user} - 關鍵指標達成進度 (目標 115%)")
-
-def create_bullet_chart(title, value, target):
-    score = (value / target) * 100
-    fig = go.Figure(go.Indicator(
-        mode = "number+gauge+delta", value = score,
-        delta = {'reference': 100, 'position': "top"},
-        title = {'text': title},
-        gauge = {
-            'shape': "bullet",
-            'axis': {'range': [0, 130]},
-            'threshold': {'line': {'color': "red", 'width': 2}, 'thickness': 0.75, 'value': 100},
-            'steps': [
-                {'range': [0, 80], 'color': "lightgray"},
-                {'range': [80, 100], 'color': "gray"},
-                {'range': [100, 115], 'color': "#90EE90"}, # 淺綠色激勵區
-                {'range': [115, 130], 'color': "#FFD700"}], # 金色榮耀區
-            'bar': {'color': "black"}
-        }
-    ))
-    fig.update_layout(height=250, margin={'t':20, 'b':20, 'l':20, 'r':20})
-    return fig
-
-c1, c2, c3 = st.columns(3)
-with c1:
-    st.plotly_chart(create_bullet_chart("毛利達成率", user_data['毛利_目前'], user_data['毛利_目標']), use_container_width=True)
-with c2:
-    st.plotly_chart(create_bullet_chart("門號達成率", user_data['門號_目前'], user_data['門號_目標']), use_container_width=True)
-with c3:
-    st.plotly_chart(create_bullet_chart("生活圈達成率", user_data['生活圈_目前'], user_data['生活圈_目標']), use_container_width=True)
-
-# --- 6. 原始數據區 ---
-with st.expander("查看原始報表數據"):
-    st.dataframe(df)
+# --- 6. 顯示詳細報表 (類似 Excel 表格) ---
+with st.expander("🔎 查看詳細日報表 (Excel 檢視)", expanded=False):
+    if not filtered_records.empty:
+        st.dataframe(filtered_records.sort_values("日期", ascending=False), use_container_width=True)
+    else:
+        st.info("目前尚無資料，請於上方填寫日報表。")
