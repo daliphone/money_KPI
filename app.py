@@ -8,13 +8,13 @@ import time
 # --- 1. 系統初始化 ---
 st.set_page_config(page_title="全店業績戰情室", layout="wide", page_icon="📈")
 
-# 初始化 Session State (用於暫存預覽資料)
-if 'preview_data' not in st.session_state:
-    st.session_state.preview_data = None
-if 'preview_score' not in st.session_state:
-    st.session_state.preview_score = 0
+# 初始化 Session State
+if 'preview_data' not in st.session_state: st.session_state.preview_data = None
+if 'preview_score' not in st.session_state: st.session_state.preview_score = 0
+# 用來記錄目前已登入的門市
+if 'authenticated_store' not in st.session_state: st.session_state.authenticated_store = None
 
-# 檢查設定
+# 檢查必要設定
 if "gcp_service_account" not in st.secrets:
     st.error("❌ 嚴重錯誤：Secrets 中找不到 [gcp_service_account]。")
     st.stop()
@@ -30,41 +30,7 @@ except ImportError:
     st.error("❌ 缺少 Google 套件，請檢查 requirements.txt")
     st.stop()
 
-# --- 2. 密碼驗證模組 ---
-def check_password():
-    if "app_password" not in st.secrets: return True
-    def password_entered():
-        if st.session_state["password"] == st.secrets["app_password"]:
-            st.session_state["password_correct"] = True
-            del st.session_state["password"]
-        else:
-            st.session_state["password_correct"] = False
-    if "password_correct" not in st.session_state:
-        st.text_input("🔒 請輸入員工/店長密碼", type="password", on_change=password_entered, key="password")
-        return False
-    elif not st.session_state["password_correct"]:
-        st.text_input("🔒 請輸入員工/店長密碼", type="password", on_change=password_entered, key="password")
-        st.error("❌ 密碼錯誤")
-        return False
-    else:
-        return True
-
-def check_admin_password():
-    if st.session_state.get("admin_logged_in", False): return True
-    if "admin_password" not in st.secrets: return True
-    st.markdown("### 🛡️ 管理員專區")
-    admin_input = st.text_input("🔑 請輸入管理員密碼", type="password", key="admin_pass_input")
-    if st.button("解鎖總表"):
-        if admin_input == st.secrets["admin_password"]:
-            st.session_state["admin_logged_in"] = True
-            st.rerun()
-        else:
-            st.error("❌ 管理員密碼錯誤")
-    return False
-
-if not check_password(): st.stop()
-
-# --- 3. Google Drive 功能 ---
+# --- 2. Google Drive 功能 (全域搜尋版) ---
 def get_drive_service():
     creds_dict = dict(st.secrets["gcp_service_account"])
     creds = service_account.Credentials.from_service_account_info(
@@ -73,30 +39,11 @@ def get_drive_service():
     return build('drive', 'v3', credentials=creds)
 
 def get_file_id_in_folder(service, filename, folder_id):
-    """
-    修正版：嘗試全域搜尋檔案，不限制在特定資料夾 ID 內。
-    解決檔案放在子資料夾 (如 202512) 導致找不到的問題。
-    """
-    # 舊寫法 (只搜特定資料夾)： f"name = '{filename}' and '{folder_id}' in parents..."
-    # 新寫法 (搜全雲端硬碟)：
+    """全域搜尋檔案，不限制資料夾"""
     query = f"name = '{filename}' and trashed = false"
-    
-    # 執行搜尋
-    results = service.files().list(
-        q=query, 
-        fields="files(id, name, parents)", 
-        orderBy="createdTime desc" # 若有重複檔名，取最新的
-    ).execute()
-    
+    results = service.files().list(q=query, fields="files(id, name)", orderBy="createdTime desc").execute()
     items = results.get('files', [])
-    
-    if not items:
-        return None
-        
-    # 如果找到多個同名檔案，印出警告 (方便除錯)
-    if len(items) > 1:
-        print(f"⚠️ 警告：找到 {len(items)} 個名為 {filename} 的檔案，將使用最新的一個 (ID: {items[0]['id']})")
-        
+    if not items: return None
     return items[0]['id']
 
 def update_excel_drive(store, staff, date_obj, data_dict):
@@ -107,7 +54,7 @@ def update_excel_drive(store, staff, date_obj, data_dict):
         service = get_drive_service()
         file_id = get_file_id_in_folder(service, filename, folder_id)
         if not file_id:
-            return f"❌ 找不到檔案 [{filename}]，請確認雲端硬碟 ID 或檔名。"
+            return f"❌ 找不到檔案 [{filename}]，請確認雲端硬碟檔名格式正確 (YYYY_MM_店名...)。"
 
         request = service.files().get_media(fileId=file_id)
         file_content = request.execute()
@@ -151,7 +98,7 @@ def update_excel_drive(store, staff, date_obj, data_dict):
     except Exception as e:
         return f"❌ 系統錯誤: {str(e)}"
 
-# --- 4. 組織與目標 ---
+# --- 3. 組織設定 ---
 STORES = {
     "(ALL) 全店總表": [],
     "文賢店": ["慧婷", "阿緯", "子翔", "默默"],
@@ -166,11 +113,14 @@ STORES = {
 }
 DEFAULT_TARGETS = {'毛利': 140000, '門號': 24, '保險': 28000, '配件': 35000, '庫存': 21}
 
-# --- 5. 介面邏輯 ---
+# --- 4. 介面與權限邏輯 (核心修改) ---
+
 st.sidebar.title("🏢 門市導航")
 selected_store = st.sidebar.selectbox("請選擇門市", list(STORES.keys()))
 
+# 根據門市決定人員選單
 if selected_store == "(ALL) 全店總表":
+    staff_options = []
     selected_user = "全店總覽"
 else:
     staff_options = ["該店總表"] + STORES[selected_store]
@@ -178,29 +128,83 @@ else:
 
 st.title(f"📊 {selected_store} - {selected_user}")
 
-# --- 主畫面邏輯 ---
+# --- 權限驗證函式 ---
+def check_store_auth(current_store):
+    """
+    驗證當前選擇的門市是否已登入
+    """
+    # 1. 如果是全店總表，走管理員驗證邏輯
+    if current_store == "(ALL) 全店總表":
+        if st.session_state.get("admin_logged_in", False):
+            return True
+            
+        st.info("🛡️ 此區域需要管理員權限")
+        admin_input = st.text_input("🔑 請輸入管理員密碼", type="password", key="admin_input")
+        if st.button("驗證管理員"):
+            if admin_input == st.secrets.get("admin_password"):
+                st.session_state["admin_logged_in"] = True
+                st.rerun()
+            else:
+                st.error("❌ 密碼錯誤")
+        return False
+
+    # 2. 如果是各分店，走分店密碼驗證邏輯
+    # 檢查是否已經登入過「這一家」店
+    if st.session_state.authenticated_store == current_store:
+        return True
+
+    # 尚未登入，顯示輸入框
+    st.info(f"🔒 請輸入【{current_store}】的專屬密碼以進行操作")
+    
+    # 使用 form 避免每打一個字就重新整理
+    with st.form("store_login"):
+        input_pass = st.text_input("密碼", type="password")
+        login_btn = st.form_submit_button("登入")
+        
+        if login_btn:
+            # 從 secrets 取得該店密碼
+            # 注意：secrets["store_passwords"] 是一個字典
+            correct_pass = st.secrets["store_passwords"].get(current_store)
+            
+            if not correct_pass:
+                st.error("⚠️ 此門市尚未設定密碼，請聯繫管理員。")
+            elif input_pass == correct_pass:
+                st.session_state.authenticated_store = current_store
+                st.success("登入成功！")
+                st.rerun()
+            else:
+                st.error("❌ 密碼錯誤")
+                
+    return False
+
+# --- 主程式邏輯 ---
+
+# 先執行權限檢查，如果沒通過，程式就停在這裡，不顯示下面的表單
+if not check_store_auth(selected_store):
+    st.stop()
+
+# =========================================================
+# 驗證通過後，顯示該店內容
+# =========================================================
 
 if selected_store == "(ALL) 全店總表":
-    if check_admin_password():
-        st.success("✅ 管理員驗證通過")
-        st.info("此處顯示全店彙整資訊...")
-        # 這裡放置全店總表程式碼
+    st.success("✅ 管理員權限已解鎖")
+    st.markdown("### 🏆 全公司業績戰情室")
+    st.info("此處未來可串接 PowerBI 或讀取所有分店 Excel 進行彙整。")
 
 else:
+    # 這裡顯示分店的操作介面
     is_input_mode = (selected_user != "該店總表")
     
     if is_input_mode:
         st.markdown("### 📝 今日業績回報")
 
-        # ----------------------------------------------------
-        # 步驟 1: 填寫表單 (不會直接上傳，只存到 Session)
-        # ----------------------------------------------------
+        # Step 1: 填寫表單
         with st.form("daily_input_full"):
             d_col1, d_col2 = st.columns([1, 3])
             input_date = d_col1.date_input("📅 報表日期", date.today())
             st.markdown("---")
 
-            # 欄位區塊
             st.subheader("💰 財務與門號 (Core)")
             c1, c2, c3, c4 = st.columns(4)
             in_profit = c1.number_input("毛利 ($)", min_value=0, step=100)
@@ -227,11 +231,9 @@ else:
             in_up_rate_raw = t2.number_input("遠傳升續率 (%)", min_value=0.0, max_value=100.0, step=0.1)
             in_flat_rate_raw = t3.number_input("遠傳平續率 (%)", min_value=0.0, max_value=100.0, step=0.1)
             
-            # 按鈕：改為「預覽」
             check_btn = st.form_submit_button("🔍 試算分數並預覽 (Step 1)", use_container_width=True)
 
             if check_btn:
-                # 1. 計算分數
                 def calc(act, tgt, w): return (act / tgt * w) if tgt > 0 else 0
                 score = (
                     calc(in_profit, DEFAULT_TARGETS['毛利'], 0.25) + 
@@ -241,7 +243,6 @@ else:
                     calc(in_stock, DEFAULT_TARGETS['庫存'], 0.15)
                 )
                 
-                # 2. 暫存資料 (還沒上傳)
                 st.session_state.preview_data = {
                     '毛利': in_profit, '門號': in_number, '保險營收': in_insur, '配件營收': in_acc,
                     '庫存手機': in_stock, '蘋果手機': in_apple, '蘋果平板+手錶': in_ipad, 'VIVO手機': in_vivo,
@@ -249,18 +250,16 @@ else:
                     '遠傳續約累積GAP': in_gap, 
                     '遠傳升續率': in_up_rate_raw / 100, 
                     '遠傳平續率': in_flat_rate_raw / 100,
-                    '日期': input_date # 暫存日期以便顯示
+                    '日期': input_date
                 }
                 st.session_state.preview_score = score
+                st.rerun()
 
-        # ----------------------------------------------------
-        # 步驟 2: 顯示預覽與確認按鈕 (在表單外面)
-        # ----------------------------------------------------
+        # Step 2: 確認上傳
         if st.session_state.preview_data:
             st.divider()
             st.markdown("### 👀 請確認下方資料是否正確？")
             
-            # 顯示預覽表格
             df_preview = pd.DataFrame([st.session_state.preview_data])
             st.dataframe(df_preview, hide_index=True)
             
@@ -269,44 +268,33 @@ else:
 
             col_confirm, col_cancel = st.columns([1, 1])
             
-            # --- [修正] Step 2 按鈕邏輯 ---
             if col_confirm.button("✅ 確認無誤，立即上傳 (Step 2)", type="primary", use_container_width=True):
-                
-                # 顯示進度條，讓使用者知道程式正在跑
                 progress_text = "連線 Google Drive 中...請稍候"
                 my_bar = st.progress(0, text=progress_text)
                 
                 try:
-                    # 準備資料
                     data_to_save = st.session_state.preview_data.copy()
                     target_date = data_to_save.pop('日期')
                     
                     my_bar.progress(30, text="正在搜尋雲端檔案...")
-                    
-                    # 執行上傳
                     result_msg = update_excel_drive(selected_store, selected_user, target_date, data_to_save)
-                    
                     my_bar.progress(100, text="處理完成！")
                     
                     if "✅" in result_msg:
                         st.success(result_msg)
                         st.balloons()
-                        # 成功後清除暫存
                         st.session_state.preview_data = None
                         st.session_state.preview_score = 0
                         time.sleep(3)
                         st.rerun()
                     else:
-                        # 顯示紅色錯誤，並保留預覽讓使用者重試
                         st.error(result_msg)
-                        st.write("🔍 **故障排除建議**：")
-                        st.write("1. 請確認 Google Drive 上的 Excel 檔名是否包含年月 (例如 `2025_12_...xlsx`)")
-                        st.write("2. 請確認機器人 (Service Account) 是否有該檔案的編輯權限")
                         
                 except Exception as e:
                     st.error(f"❌ 發生未預期的錯誤: {str(e)}")
             
-            # 取消按鈕
             if col_cancel.button("❌ 有錯誤，重新填寫", use_container_width=True):
                 st.session_state.preview_data = None
                 st.rerun()
+    else:
+        st.info(f"歡迎來到 {selected_store} 門市總表 (開發中)")
