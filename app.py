@@ -8,14 +8,20 @@ import time
 # --- 1. 系統初始化 ---
 st.set_page_config(page_title="全店業績戰情室", layout="wide", page_icon="📈")
 
-# 檢查必要設定
+# 初始化 Session State (用於暫存預覽資料)
+if 'preview_data' not in st.session_state:
+    st.session_state.preview_data = None
+if 'preview_score' not in st.session_state:
+    st.session_state.preview_score = 0
+
+# 檢查設定
 if "gcp_service_account" not in st.secrets:
     st.error("❌ 嚴重錯誤：Secrets 中找不到 [gcp_service_account]。")
     st.stop()
 if "TARGET_FOLDER_ID" not in st.secrets:
     st.warning("⚠️ 警告：Secrets 中找不到 TARGET_FOLDER_ID。")
 
-# Google 套件引入
+# Google 套件
 try:
     from google.oauth2 import service_account
     from googleapiclient.discovery import build
@@ -24,18 +30,15 @@ except ImportError:
     st.error("❌ 缺少 Google 套件，請檢查 requirements.txt")
     st.stop()
 
-# --- 2. 密碼驗證模組 (第一層：全站) ---
+# --- 2. 密碼驗證模組 ---
 def check_password():
-    if "app_password" not in st.secrets:
-        return True
-
+    if "app_password" not in st.secrets: return True
     def password_entered():
         if st.session_state["password"] == st.secrets["app_password"]:
             st.session_state["password_correct"] = True
             del st.session_state["password"]
         else:
             st.session_state["password_correct"] = False
-
     if "password_correct" not in st.session_state:
         st.text_input("🔒 請輸入員工/店長密碼", type="password", on_change=password_entered, key="password")
         return False
@@ -46,36 +49,22 @@ def check_password():
     else:
         return True
 
-# --- 3. 管理員密碼驗證 (第二層：全店總表) ---
 def check_admin_password():
-    """檢查是否輸入正確的管理員密碼"""
-    # 如果已經登入過管理員，直接通過
-    if st.session_state.get("admin_logged_in", False):
-        return True
-        
-    if "admin_password" not in st.secrets:
-        st.warning("⚠️ 未設定 admin_password，所有人皆可查看總表。")
-        return True
-
+    if st.session_state.get("admin_logged_in", False): return True
+    if "admin_password" not in st.secrets: return True
     st.markdown("### 🛡️ 管理員專區")
-    st.info("此區域包含敏感數據，請輸入第二層密碼。")
-    
     admin_input = st.text_input("🔑 請輸入管理員密碼", type="password", key="admin_pass_input")
-    
     if st.button("解鎖總表"):
         if admin_input == st.secrets["admin_password"]:
             st.session_state["admin_logged_in"] = True
             st.rerun()
         else:
             st.error("❌ 管理員密碼錯誤")
-            
     return False
 
-# 執行第一層檢查
-if not check_password():
-    st.stop()
+if not check_password(): st.stop()
 
-# --- 4. Google Drive 功能 ---
+# --- 3. Google Drive 功能 ---
 def get_drive_service():
     creds_dict = dict(st.secrets["gcp_service_account"])
     creds = service_account.Credentials.from_service_account_info(
@@ -98,7 +87,7 @@ def update_excel_drive(store, staff, date_obj, data_dict):
         service = get_drive_service()
         file_id = get_file_id_in_folder(service, filename, folder_id)
         if not file_id:
-            return f"❌ 找不到檔案 [{filename}]，請確認雲端硬碟檔名是否正確。"
+            return f"❌ 找不到檔案 [{filename}]，請確認雲端硬碟 ID 或檔名。"
 
         request = service.files().get_media(fileId=file_id)
         file_content = request.execute()
@@ -142,7 +131,7 @@ def update_excel_drive(store, staff, date_obj, data_dict):
     except Exception as e:
         return f"❌ 系統錯誤: {str(e)}"
 
-# --- 5. 組織設定 ---
+# --- 4. 組織與目標 ---
 STORES = {
     "(ALL) 全店總表": [],
     "文賢店": ["慧婷", "阿緯", "子翔", "默默"],
@@ -155,14 +144,12 @@ STORES = {
     "五甲店": ["阿凱", "孟婧", "支援", "人員2"],
     "鳳山店": ["店長", "組員"]
 }
-
 DEFAULT_TARGETS = {'毛利': 140000, '門號': 24, '保險': 28000, '配件': 35000, '庫存': 21}
 
-# --- 6. 介面邏輯 ---
+# --- 5. 介面邏輯 ---
 st.sidebar.title("🏢 門市導航")
 selected_store = st.sidebar.selectbox("請選擇門市", list(STORES.keys()))
 
-# 根據門市決定人員選單
 if selected_store == "(ALL) 全店總表":
     selected_user = "全店總覽"
 else:
@@ -171,39 +158,29 @@ else:
 
 st.title(f"📊 {selected_store} - {selected_user}")
 
-# --- 邏輯分支：全店總表 vs 單店填寫 ---
+# --- 主畫面邏輯 ---
 
 if selected_store == "(ALL) 全店總表":
-    # 呼叫第二層密碼檢查
     if check_admin_password():
-        # --- 這裡顯示全店總表的內容 (需驗證通過才看得到) ---
         st.success("✅ 管理員驗證通過")
-        
-        st.markdown("### 🏆 全公司業績戰情室")
-        st.info("此處未來可串接 PowerBI 或讀取所有分店 Excel 進行彙整。")
-        
-        # 這裡可以做一個簡單的「分店檔案檢視器」作為範例
-        st.markdown("#### 📂 快速檢視分店報表狀態")
-        view_store = st.selectbox("選擇要檢視的分店 (僅檢視)", [s for s in STORES.keys() if s != "(ALL) 全店總表"])
-        view_date = st.date_input("選擇月份 (讀取該月檔案)", date.today())
-        
-        filename = f"{view_date.year}_{view_date.month:02d}_{view_store}業績日報表.xlsx"
-        st.write(f"正在監控檔案： `{filename}`")
-        # (這裡未來可以加入讀取 Excel 並畫圖的功能)
+        st.info("此處顯示全店彙整資訊...")
+        # 這裡放置全店總表程式碼
 
 else:
-    # --- 單店/個人模式 (不需要第二層密碼) ---
     is_input_mode = (selected_user != "該店總表")
     
     if is_input_mode:
         st.markdown("### 📝 今日業績回報")
-        st.info("💡 數值將「累加」，GAP/比率類為「覆蓋」。")
 
-        with st.form("daily_input_full", clear_on_submit=True):
+        # ----------------------------------------------------
+        # 步驟 1: 填寫表單 (不會直接上傳，只存到 Session)
+        # ----------------------------------------------------
+        with st.form("daily_input_full"):
             d_col1, d_col2 = st.columns([1, 3])
             input_date = d_col1.date_input("📅 報表日期", date.today())
             st.markdown("---")
 
+            # 欄位區塊
             st.subheader("💰 財務與門號 (Core)")
             c1, c2, c3, c4 = st.columns(4)
             in_profit = c1.number_input("毛利 ($)", min_value=0, step=100)
@@ -230,14 +207,11 @@ else:
             in_up_rate_raw = t2.number_input("遠傳升續率 (%)", min_value=0.0, max_value=100.0, step=0.1)
             in_flat_rate_raw = t3.number_input("遠傳平續率 (%)", min_value=0.0, max_value=100.0, step=0.1)
             
-            in_up_rate = in_up_rate_raw / 100
-            in_flat_rate = in_flat_rate_raw / 100
+            # 按鈕：改為「預覽」
+            check_btn = st.form_submit_button("🔍 試算分數並預覽 (Step 1)", use_container_width=True)
 
-            st.markdown("---")
-            submit = st.form_submit_button("🚀 提交並寫入 Excel", use_container_width=True)
-
-            if submit:
-                # 簡易前端算分
+            if check_btn:
+                # 1. 計算分數
                 def calc(act, tgt, w): return (act / tgt * w) if tgt > 0 else 0
                 score = (
                     calc(in_profit, DEFAULT_TARGETS['毛利'], 0.25) + 
@@ -246,23 +220,32 @@ else:
                     calc(in_acc, DEFAULT_TARGETS['配件'], 0.15) + 
                     calc(in_stock, DEFAULT_TARGETS['庫存'], 0.15)
                 )
-
-                data_to_save = {
+                
+                # 2. 暫存資料 (還沒上傳)
+                st.session_state.preview_data = {
                     '毛利': in_profit, '門號': in_number, '保險營收': in_insur, '配件營收': in_acc,
                     '庫存手機': in_stock, '蘋果手機': in_apple, '蘋果平板+手錶': in_ipad, 'VIVO手機': in_vivo,
                     '生活圈': in_life, 'GOOGLE 評論': in_review, '來客數': in_traffic,
-                    '遠傳續約累積GAP': in_gap, '遠傳升續率': in_up_rate, '遠傳平續率': in_flat_rate
+                    '遠傳續約累積GAP': in_gap, 
+                    '遠傳升續率': in_up_rate_raw / 100, 
+                    '遠傳平續率': in_flat_rate_raw / 100,
+                    '日期': input_date # 暫存日期以便顯示
                 }
-                
-                with st.spinner("正在連線 Google Drive 同步資料..."):
-                    result_msg = update_excel_drive(selected_store, selected_user, input_date, data_to_save)
-                
-                if "✅" in result_msg:
-                    st.success(result_msg)
-                    if score > 0:
-                        st.info(f"💡 預估貢獻綜合指標：{score*100:.2f} 分")
-                else:
-                    st.error(result_msg)
-    else:
-        # 單店總表顯示區
-        st.info(f"歡迎查看 {selected_store} 門市總表 (開發中)")
+                st.session_state.preview_score = score
+
+        # ----------------------------------------------------
+        # 步驟 2: 顯示預覽與確認按鈕 (在表單外面)
+        # ----------------------------------------------------
+        if st.session_state.preview_data:
+            st.divider()
+            st.markdown("### 👀 請確認下方資料是否正確？")
+            
+            # 顯示預覽表格
+            df_preview = pd.DataFrame([st.session_state.preview_data])
+            # 把日期格式修飾一下，不顯示 index
+            st.dataframe(df_preview, hide_index=True)
+            
+            if st.session_state.preview_score > 0:
+                st.info(f"💡 預估綜合指標貢獻：{st.session_state.preview_score*100:.1f} 分")
+            else:
+                st.warning("⚠️ 注意：目前沒有輸入任何業績 (0 分)")
