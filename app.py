@@ -2,6 +2,99 @@ import streamlit as st
 import pandas as pd
 from datetime import date
 import calendar
+import openpyxl
+import os
+
+def update_excel_accumulate(store, staff, date_obj, data_dict):
+    """
+    將資料寫回 Excel，並執行累加邏輯
+    store: 門市名稱 (如 "東門店")
+    staff: 人員名稱 (如 "小萬")
+    date_obj: 日期物件
+    data_dict: 要寫入的資料字典 {'毛利': 1000, '門號': 1...}
+    """
+    # 1. 組合物件路徑 (假設檔案都在同一層資料夾，檔名格式為 "門市業績日報表.xlsx")
+    filename = f"{store}業績日報表.xlsx"
+    
+    if not os.path.exists(filename):
+        return f"❌ 找不到檔案：{filename}，請確認檔案是否已上傳。"
+
+    try:
+        # 載入 Excel (data_only=False 以保留公式)
+        wb = openpyxl.load_workbook(filename)
+        
+        # 檢查是否有該人員的分頁
+        if staff not in wb.sheetnames:
+            # 有些分頁可能是本名，若找不到需人工對應，這裡先假設名稱一致
+            return f"❌ 找不到人員分頁：{staff}，請確認 Excel 分頁名稱。"
+        
+        ws = wb[staff]
+        
+        # 2. 計算寫入的列號 (Row)
+        # 根據你的 Excel 結構：
+        # Row 15 對應 "1號" (因為 Row 14 是標題或上一列，Row 15 A欄是 '1')
+        # 公式：起始列 (15) + (日期 - 1)
+        target_row = 15 + (date_obj.day - 1)
+        
+        # 雙重確認：檢查該列的 A 欄 (第1欄) 是否真的是該日期
+        # openpyxl index 從 1 開始
+        check_day = ws.cell(row=target_row, column=1).value
+        if str(check_day) != str(date_obj.day):
+            return f"⚠️ 日期定位錯誤！Excel 第 {target_row} 列是 {check_day} 號，但你要填 {date_obj.day} 號。"
+
+        # 3. 定義欄位對應 (Column Map) - 根據你的 Excel 結構 (B欄是毛利...)
+        # A=1, B=2, C=3...
+        col_map = {
+            '毛利': 2,           # B欄
+            '門號': 3,           # C欄
+            '保險營收': 4,       # D欄
+            '配件營收': 5,       # E欄
+            '庫存手機': 6,       # F欄
+            '蘋果手機': 7,       # G欄
+            '蘋果平板+手錶': 8,   # H欄
+            'VIVO手機': 9,       # I欄
+            '生活圈': 10,        # J欄
+            'GOOGLE 評論': 11,   # K欄
+            '來客數': 12,        # L欄
+            '遠傳續約累積GAP': 13, # M欄 (覆蓋)
+            '遠傳升續率': 14,     # N欄 (覆蓋)
+            '遠傳平續率': 15      # O欄 (覆蓋)
+        }
+
+        # 4. 執行寫入 (含累加邏輯)
+        # 這些欄位採取「覆蓋」模式 (Snapshot)，因為它們通常是當日最終狀態
+        overwrite_fields = ['遠傳續約累積GAP', '遠傳升續率', '遠傳平續率']
+
+        updated_msg = [] # 紀錄更新了什麼
+
+        for field, new_val in data_dict.items():
+            if field in col_map and new_val is not None:
+                col_idx = col_map[field]
+                cell = ws.cell(row=target_row, column=col_idx)
+                
+                # 取得舊數值 (若為 None 轉為 0)
+                old_val = cell.value
+                if old_val is None or not isinstance(old_val, (int, float)):
+                    old_val = 0
+                
+                # 判斷是「累加」還是「覆蓋」
+                if field in overwrite_fields:
+                    final_val = new_val
+                    op_msg = "(覆蓋)"
+                else:
+                    final_val = old_val + new_val
+                    op_msg = f"(累加 {old_val} + {new_val})"
+
+                # 寫入儲存格
+                cell.value = final_val
+                updated_msg.append(f"{field}: {final_val} {op_msg}")
+
+        # 5. 存檔
+        wb.save(filename)
+        return f"✅ {date_obj} 資料已成功寫入並存檔！\n" + "\n".join(updated_msg)
+
+    except Exception as e:
+        return f"❌ 存檔失敗: {str(e)}"
 
 # --- 1. 系統初始化與組織設定 ---
 st.set_page_config(page_title="全店業績戰情室", layout="wide", page_icon="🏢")
@@ -232,7 +325,41 @@ if is_input_mode:
             
             # 重新執行以更新上方儀表板數據
             # st.rerun() # 如果Streamlit版本較舊報錯，請註解掉這行
+            if submit:
+            # ... (原本的計算分數與建立 new_data 邏輯保持不變) ...
 
+            # [新增] 呼叫存檔函式
+            # 注意：這裡假設你的環境有權限寫入檔案 (本地執行 OK，Streamlit Cloud 需改用雲端 API)
+            
+            # 準備要寫入 Excel 的精簡資料 (排除日期、門市等非數值欄位)
+            excel_data = {
+                '毛利': in_profit,
+                '門號': in_number,
+                '保險營收': in_insur,
+                '配件營收': in_acc,
+                '庫存手機': in_stock,
+                '蘋果手機': in_apple,
+                '蘋果平板+手錶': in_ipad,
+                'VIVO手機': in_vivo,
+                '生活圈': in_life,
+                'GOOGLE 評論': in_review,
+                '來客數': in_traffic,
+                '遠傳續約累積GAP': in_gap,
+                '遠傳升續率': in_up_rate,
+                '遠傳平續率': in_flat_rate
+            }
+
+            # 執行寫入
+            save_msg = update_excel_accumulate(selected_store, selected_user, input_date, excel_data)
+            
+            # 顯示結果
+            if "✅" in save_msg:
+                st.success(save_msg)
+                # 同步更新網頁上的 Session State，讓儀表板也累加
+                # (這裡邏輯稍微複雜，簡單做法是直接重整頁面讀取新 Excel，或手動更新 Session)
+            else:
+                st.error(save_msg)
+                
 # --- 6. 總表分析區 (Dashboard) - 只有選總表時出現 ---
 if not is_input_mode and not filtered_df.empty:
     st.subheader("📊 詳細數據分析")
@@ -248,3 +375,4 @@ if not is_input_mode and not filtered_df.empty:
 
 elif not is_input_mode:
     st.info("尚無數據，請先至「個人頁面」輸入資料。")
+
