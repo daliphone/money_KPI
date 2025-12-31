@@ -1,174 +1,166 @@
 import streamlit as st
 import pandas as pd
-import plotly.graph_objects as go
-from datetime import datetime, date
+from datetime import date
 import calendar
 
-# --- 1. 系統設定與模擬資料庫 ---
-st.set_page_config(page_title="東門店業績管理系統", layout="wide", page_icon="📈")
+# --- 1. 系統初始化與組織設定 ---
+st.set_page_config(page_title="全店業績戰情室", layout="wide", page_icon="🏢")
 
-# 初始化 Session State (模擬資料庫，讓網頁重新整理後資料還在)
-# 未來這一步會換成連接 Google Sheets
+# 定義組織與人員結構 (依據你的檔案)
+STORES = {
+    "(ALL) 全店總表": [],
+    "文賢店": ["慧婷", "阿緯", "子翔", "默默"],
+    "東門店": ["小萬", "914", "默默", "人員4"],
+    "永康店": ["宗憲", "筑君", "澤偉", "翰霖", "77", "支援"],
+    "歸仁店": ["配飯", "誌廷", "阿孝", "支援", "人員2"],
+    "安中店": ["宗憲", "大俗", "翰霖", "澤偉"],
+    "小西門店": ["豆豆", "秀秀", "人員3", "人員4"],
+    "鹽行店": ["配飯", "薪融", "脆迪", "誌廷", "人員2"],
+    "五甲店": ["阿凱", "孟婧", "支援", "人員2"],
+    "鳳山店": []
+}
+
+# 模擬資料庫 (實際運作需連接 Google Sheets)
 if 'db' not in st.session_state:
-    # 建立模擬的目標設定 (對應 Excel 上半部目標區)
+    # 建立一個包含 '門市' 欄位的資料表
+    st.session_state.records = pd.DataFrame(
+        columns=['門市', '人員', '日期', '毛利', '門號', '保險', '配件', '庫存', '蘋果', 'VIVO']
+    )
+    # 預設目標 (簡化版，實際應從 Excel 讀取)
     st.session_state.targets = {
-        '小萬': {'毛利': 140000, '門號': 24, '保險': 28000, '配件': 35000, '庫存': 21},
-        '914':  {'毛利': 140000, '門號': 24, '保險': 28000, '配件': 35000, '庫存': 21},
-        '默默': {'毛利': 140000, '門號': 24, '保險': 28000, '配件': 35000, '庫存': 21},
-        '東門店': {'毛利': 462000, '門號': 84, '保險': 105000, '配件': 126000, '庫存': 56} # 店總目標
+        '毛利': 140000, '門號': 24, '保險': 28000, '配件': 35000, '庫存': 21
     }
-    
-    # 建立模擬的每日業績紀錄 (對應 Excel 下半部填寫區)
-    # 格式: [日期, 毛利, 門號, 保險, 配件, 庫存]
-    st.session_state.records = pd.DataFrame(columns=['人員', '日期', '毛利', '門號', '保險', '配件', '庫存'])
 
-# --- 2. 左側導航：門市與人員選擇 ---
-st.sidebar.title("🏢 門市管理系統")
+# --- 2. 側邊欄：導航中心 ---
+st.sidebar.title("🏢 門市導航")
+selected_store = st.sidebar.selectbox("選擇門市", list(STORES.keys()))
 
-# 定義組織架構
-org_structure = {
-    "台南區": {
-        "東門店": ["小萬", "914", "默默", "人員4"],
-        "西門店": ["店長A", "組員B"] # 範例，可擴充
-    }
-}
-
-# 第一層：選擇區域 (預留擴充)
-region = "台南區" 
-
-# 第二層：選擇門市
-selected_store = st.sidebar.selectbox("請選擇門市", list(org_structure[region].keys()))
-
-# 第三層：選擇人員 (包含「全店總表」選項)
-staff_list = ["全店總表"] + org_structure[region][selected_store]
-selected_user = st.sidebar.selectbox("請選擇人員", staff_list)
-
-st.sidebar.markdown("---")
-st.sidebar.info(f"目前操作身份：\n**{selected_store} - {selected_user}**")
-
-# --- 3. 頂部：資料輸入區 (針對個人) ---
-# 只有選擇「個人」時才顯示輸入框，選「全店總表」時不顯示
-if selected_user != "全店總表":
-    with st.expander("📝 **每日業績回報 (點擊展開)**", expanded=True):
-        st.write(f"正在填寫：**{selected_user}** 的業績紀錄")
-        
-        with st.form("daily_report_form"):
-            col_date, col_1, col_2, col_3, col_4, col_5 = st.columns(6)
-            
-            with col_date:
-                input_date = st.date_input("日期", date.today())
-            with col_1:
-                in_profit = st.number_input("毛利", min_value=0, step=100)
-            with col_2:
-                in_number = st.number_input("門號", min_value=0, step=1)
-            with col_3:
-                in_insur = st.number_input("保險營收", min_value=0, step=100)
-            with col_4:
-                in_acc = st.number_input("配件營收", min_value=0, step=100)
-            with col_5:
-                in_stock = st.number_input("庫存手機", min_value=0, step=1)
-            
-            submitted = st.form_submit_button("💾 提交日報表")
-            
-            if submitted:
-                # 將資料寫入 Session State (模擬存檔)
-                new_record = {
-                    '人員': selected_user,
-                    '日期': input_date,
-                    '毛利': in_profit,
-                    '門號': in_number,
-                    '保險': in_insur,
-                    '配件': in_acc,
-                    '庫存': in_stock
-                }
-                st.session_state.records = pd.concat([st.session_state.records, pd.DataFrame([new_record])], ignore_index=True)
-                st.success(f"{input_date} 業績已儲存！")
-
-# --- 4. 核心邏輯運算 (Excel 公式移植) ---
-
-# A. 取得該員(或該店)的目標
-if selected_user == "全店總表":
-    # 若選全店，目標是店總目標
-    target_data = st.session_state.targets.get(selected_store, {'毛利': 1, '門號': 1, '保險': 1, '配件': 1, '庫存': 1})
-    # 業績是所有人加總
-    filtered_records = st.session_state.records # 這裡簡化，實際應篩選該店所有人
+# 根據門市選擇人員
+if selected_store == "(ALL) 全店總表":
+    selected_user = "全店總覽"
+    st.sidebar.info("目前檢視：全公司彙整數據")
 else:
-    # 若選個人，目標是個人目標
-    target_data = st.session_state.targets.get(selected_user, {'毛利': 1, '門號': 1, '保險': 1, '配件': 1, '庫存': 1})
-    # 業績是個人篩選
-    filtered_records = st.session_state.records[st.session_state.records['人員'] == selected_user]
+    # 加上 "該店總表" 選項
+    staff_options = ["該店總表"] + STORES[selected_store]
+    selected_user = st.sidebar.selectbox("選擇人員 / 檢視層級", staff_options)
 
-# B. 計算累計業績 (SUM)
-current_performance = {
-    '毛利': filtered_records['毛利'].sum() if not filtered_records.empty else 0,
-    '門號': filtered_records['門號'].sum() if not filtered_records.empty else 0,
-    '保險': filtered_records['保險'].sum() if not filtered_records.empty else 0,
-    '配件': filtered_records['配件'].sum() if not filtered_records.empty else 0,
-    '庫存': filtered_records['庫存'].sum() if not filtered_records.empty else 0,
+# --- 3. 邏輯核心：資料過濾與運算 ---
+
+# 根據選擇的層級，篩選資料
+if selected_store == "(ALL) 全店總表":
+    # 抓取所有資料
+    filtered_df = st.session_state.records
+    view_title = "🏆 全公司 - 業績總表"
+    is_input_mode = False
+elif selected_user == "該店總表":
+    # 抓取該分店所有人的資料
+    filtered_df = st.session_state.records[st.session_state.records['門市'] == selected_store]
+    view_title = f"🏪 {selected_store} - 門市總表"
+    is_input_mode = False
+else:
+    # 抓取該員工資料
+    filtered_df = st.session_state.records[
+        (st.session_state.records['門市'] == selected_store) & 
+        (st.session_state.records['人員'] == selected_user)
+    ]
+    view_title = f"👤 {selected_store} - {selected_user}"
+    is_input_mode = True
+
+# 計算當前彙整數據 (Sum)
+current_stats = {
+    '毛利': filtered_df['毛利'].sum() if not filtered_df.empty else 0,
+    '門號': filtered_df['門號'].sum() if not filtered_df.empty else 0,
+    '保險': filtered_df['保險'].sum() if not filtered_df.empty else 0,
+    '配件': filtered_df['配件'].sum() if not filtered_df.empty else 0,
 }
 
-# C. 計算時間參數 (對應 Excel 左上角時間區)
+# 目標設定 (若是總表，目標要放大)
+multiplier = 1
+if selected_store == "(ALL) 全店總表":
+    multiplier = 8 # 假設有8間店
+elif selected_user == "該店總表":
+    multiplier = 4 # 假設平均一間店4人
+    
+target_stats = {k: v * multiplier for k, v in st.session_state.targets.items()}
+
+# --- 4. 儀表板顯示區 (View) ---
+st.title(view_title)
+
+# 動能計算
 today = date.today()
-last_day_of_month = calendar.monthrange(today.year, today.month)[1]
-remaining_days = last_day_of_month - today.day
+last_day = calendar.monthrange(today.year, today.month)[1]
+remaining_days = last_day - today.day
 if remaining_days < 0: remaining_days = 0
 
-# --- 5. 儀表板呈現區 ---
+col1, col2, col3, col4 = st.columns(4)
 
-st.title(f"📊 {selected_user} - 業績動態戰情室")
-st.markdown("---")
-
-# 定義一個顯示卡片的函式 (包含動能計算公式)
-def display_kpi(label, current, target, unit=""):
-    # 1. 達成率公式
-    achievement_rate = (current / target) * 100 if target > 0 else 0
-    
-    # 2. GAP (落差) 公式
+def show_metric(col, label, current, target):
     gap = target - current
-    
-    # 3. 日動能 (Momentum) 公式： (目標 - 目前) / 剩餘天數
     momentum = gap / remaining_days if remaining_days > 0 and gap > 0 else 0
+    achievement = (current / target) * 100 if target > 0 else 0
     
-    col1, col2 = st.columns([2, 1])
-    with col1:
+    with col:
         st.metric(
-            label=f"{label} (目標: {target:,})",
-            value=f"{current:,} {unit}",
-            delta=f"{achievement_rate:.1f}% 達成 (GAP: {gap:,})"
+            label=label,
+            value=f"{current:,}",
+            delta=f"{achievement:.1f}% (GAP: {gap:,})"
         )
-    with col2:
         if gap > 0:
-            st.metric(
-                label="🔥 每日需達 (動能)",
-                value=f"{int(momentum):,} {unit}",
-                delta="落後追趕中" if momentum > (target/last_day_of_month) else "進度安全",
-                delta_color="inverse"
+            st.caption(f"🔥 每日需達: {int(momentum):,}")
+
+show_metric(col1, "💰 毛利", current_stats['毛利'], target_stats['毛利'])
+show_metric(col2, "📱 門號", current_stats['門號'], target_stats['門號'])
+show_metric(col3, "🛡️ 保險", current_stats['保險'], target_stats['保險'])
+show_metric(col4, "🔌 配件", current_stats['配件'], target_stats['配件'])
+
+st.divider()
+
+# --- 5. 資料輸入區 (Input) - 只有選個人時才出現 ---
+if is_input_mode:
+    st.subheader(f"📝 {selected_user} - 今日業績回報")
+    with st.form("daily_input"):
+        d_col1, d_col2 = st.columns([1, 2])
+        input_date = d_col1.date_input("日期", date.today())
+        
+        c1, c2, c3, c4 = st.columns(4)
+        in_profit = c1.number_input("毛利", step=100)
+        in_number = c2.number_input("門號", step=1)
+        in_insur = c3.number_input("保險", step=100)
+        in_acc = c4.number_input("配件", step=100)
+        
+        # 這裡可以加入更多 Excel 中的欄位 (庫存、蘋果、VIVO...)
+        
+        submit = st.form_submit_button("提交日報表", use_container_width=True)
+        
+        if submit:
+            new_data = {
+                '門市': selected_store,
+                '人員': selected_user,
+                '日期': input_date,
+                '毛利': in_profit,
+                '門號': in_number,
+                '保險': in_insur,
+                '配件': in_acc,
+                '庫存': 0, '蘋果': 0, 'VIVO': 0 # 範例預設
+            }
+            # 寫入 Session State (實際應寫入 Google Sheets)
+            st.session_state.records = pd.concat(
+                [st.session_state.records, pd.DataFrame([new_data])], 
+                ignore_index=True
             )
-        else:
-             st.metric(label="✨ 狀態", value="已達標", delta="恭喜！")
+            st.success("✅ 資料已儲存！上方儀表板已更新。")
+            st.rerun()
+
+# --- 6. 總表分析區 (Dashboard) - 只有選總表時出現 ---
+if not is_input_mode and not filtered_df.empty:
+    st.subheader("📊 詳細數據分析")
     
-    # 4. 進度條 (移植 115% 視覺化)
-    st.progress(min(achievement_rate / 115, 1.0)) # 假設 115% 是滿條
-    st.caption(f"目前達成率: {achievement_rate:.1f}% / 115% (超額激勵目標)")
+    # 依照人員/門市分組顯示
+    group_col = '人員' if selected_user == "該店總表" else '門市'
+    summary = filtered_df.groupby(group_col)[['毛利', '門號', '保險', '配件']].sum().reset_index()
+    
+    st.bar_chart(summary, x=group_col, y=['毛利', '保險', '配件'])
+    st.dataframe(summary, use_container_width=True)
 
-# 顯示各項指標
-kpi_col1, kpi_col2 = st.columns(2)
-
-with kpi_col1:
-    st.subheader("💰 營收核心")
-    display_kpi("毛利", current_performance['毛利'], target_data['毛利'])
-    st.divider()
-    display_kpi("保險營收", current_performance['保險'], target_data['保險'])
-
-with kpi_col2:
-    st.subheader("📱 件數核心")
-    display_kpi("門號數", current_performance['門號'], target_data['門號'], "件")
-    st.divider()
-    display_kpi("配件營收", current_performance['配件'], target_data['配件'])
-
-# --- 6. 顯示詳細報表 (類似 Excel 表格) ---
-with st.expander("🔎 查看詳細日報表 (Excel 檢視)", expanded=False):
-    if not filtered_records.empty:
-        st.dataframe(filtered_records.sort_values("日期", ascending=False), use_container_width=True)
-    else:
-        st.info("目前尚無資料，請於上方填寫日報表。")
+elif not is_input_mode:
+    st.info("尚無數據，請先至「個人頁面」輸入資料。")
