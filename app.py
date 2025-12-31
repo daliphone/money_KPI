@@ -1,166 +1,113 @@
-import streamlit as st
-import pandas as pd
-from datetime import date
-import calendar
-
-# --- 1. 系統初始化與組織設定 ---
-st.set_page_config(page_title="全店業績戰情室", layout="wide", page_icon="🏢")
-
-# 定義組織與人員結構 (依據你的檔案)
-STORES = {
-    "(ALL) 全店總表": [],
-    "文賢店": ["慧婷", "阿緯", "子翔", "默默"],
-    "東門店": ["小萬", "914", "默默", "人員4"],
-    "永康店": ["宗憲", "筑君", "澤偉", "翰霖", "77", "支援"],
-    "歸仁店": ["配飯", "誌廷", "阿孝", "支援", "人員2"],
-    "安中店": ["宗憲", "大俗", "翰霖", "澤偉"],
-    "小西門店": ["豆豆", "秀秀", "人員3", "人員4"],
-    "鹽行店": ["配飯", "薪融", "脆迪", "誌廷", "人員2"],
-    "五甲店": ["阿凱", "孟婧", "支援", "人員2"],
-    "鳳山店": []
-}
-
-# 模擬資料庫 (實際運作需連接 Google Sheets)
-if 'db' not in st.session_state:
-    # 建立一個包含 '門市' 欄位的資料表
-    st.session_state.records = pd.DataFrame(
-        columns=['門市', '人員', '日期', '毛利', '門號', '保險', '配件', '庫存', '蘋果', 'VIVO']
-    )
-    # 預設目標 (簡化版，實際應從 Excel 讀取)
-    st.session_state.targets = {
-        '毛利': 140000, '門號': 24, '保險': 28000, '配件': 35000, '庫存': 21
-    }
-
-# --- 2. 側邊欄：導航中心 ---
-st.sidebar.title("🏢 門市導航")
-selected_store = st.sidebar.selectbox("選擇門市", list(STORES.keys()))
-
-# 根據門市選擇人員
-if selected_store == "(ALL) 全店總表":
-    selected_user = "全店總覽"
-    st.sidebar.info("目前檢視：全公司彙整數據")
-else:
-    # 加上 "該店總表" 選項
-    staff_options = ["該店總表"] + STORES[selected_store]
-    selected_user = st.sidebar.selectbox("選擇人員 / 檢視層級", staff_options)
-
-# --- 3. 邏輯核心：資料過濾與運算 ---
-
-# 根據選擇的層級，篩選資料
-if selected_store == "(ALL) 全店總表":
-    # 抓取所有資料
-    filtered_df = st.session_state.records
-    view_title = "🏆 全公司 - 業績總表"
-    is_input_mode = False
-elif selected_user == "該店總表":
-    # 抓取該分店所有人的資料
-    filtered_df = st.session_state.records[st.session_state.records['門市'] == selected_store]
-    view_title = f"🏪 {selected_store} - 門市總表"
-    is_input_mode = False
-else:
-    # 抓取該員工資料
-    filtered_df = st.session_state.records[
-        (st.session_state.records['門市'] == selected_store) & 
-        (st.session_state.records['人員'] == selected_user)
-    ]
-    view_title = f"👤 {selected_store} - {selected_user}"
-    is_input_mode = True
-
-# 計算當前彙整數據 (Sum)
-current_stats = {
-    '毛利': filtered_df['毛利'].sum() if not filtered_df.empty else 0,
-    '門號': filtered_df['門號'].sum() if not filtered_df.empty else 0,
-    '保險': filtered_df['保險'].sum() if not filtered_df.empty else 0,
-    '配件': filtered_df['配件'].sum() if not filtered_df.empty else 0,
-}
-
-# 目標設定 (若是總表，目標要放大)
-multiplier = 1
-if selected_store == "(ALL) 全店總表":
-    multiplier = 8 # 假設有8間店
-elif selected_user == "該店總表":
-    multiplier = 4 # 假設平均一間店4人
-    
-target_stats = {k: v * multiplier for k, v in st.session_state.targets.items()}
-
-# --- 4. 儀表板顯示區 (View) ---
-st.title(view_title)
-
-# 動能計算
-today = date.today()
-last_day = calendar.monthrange(today.year, today.month)[1]
-remaining_days = last_day - today.day
-if remaining_days < 0: remaining_days = 0
-
-col1, col2, col3, col4 = st.columns(4)
-
-def show_metric(col, label, current, target):
-    gap = target - current
-    momentum = gap / remaining_days if remaining_days > 0 and gap > 0 else 0
-    achievement = (current / target) * 100 if target > 0 else 0
-    
-    with col:
-        st.metric(
-            label=label,
-            value=f"{current:,}",
-            delta=f"{achievement:.1f}% (GAP: {gap:,})"
-        )
-        if gap > 0:
-            st.caption(f"🔥 每日需達: {int(momentum):,}")
-
-show_metric(col1, "💰 毛利", current_stats['毛利'], target_stats['毛利'])
-show_metric(col2, "📱 門號", current_stats['門號'], target_stats['門號'])
-show_metric(col3, "🛡️ 保險", current_stats['保險'], target_stats['保險'])
-show_metric(col4, "🔌 配件", current_stats['配件'], target_stats['配件'])
-
-st.divider()
-
-# --- 5. 資料輸入區 (Input) - 只有選個人時才出現 ---
+# --- [更新版] 資料輸入區：完整欄位 ---
 if is_input_mode:
-    st.subheader(f"📝 {selected_user} - 今日業績回報")
-    with st.form("daily_input"):
-        d_col1, d_col2 = st.columns([1, 2])
-        input_date = d_col1.date_input("日期", date.today())
+    st.markdown(f"### 📝 {selected_user} - 今日業績回報")
+    st.info("💡 系統將自動計算「綜合指標分數」，請準確填寫。")
+
+    with st.form("daily_input_full", clear_on_submit=True):
+        d_col1, d_col2 = st.columns([1, 3])
+        input_date = d_col1.date_input("📅 報表日期", date.today())
         
+        st.markdown("---")
+
+        # --- 第一區：核心營收 (權重佔比 55%) ---
+        st.subheader("💰 財務與門號 (Core)")
         c1, c2, c3, c4 = st.columns(4)
-        in_profit = c1.number_input("毛利", step=100)
-        in_number = c2.number_input("門號", step=1)
-        in_insur = c3.number_input("保險", step=100)
-        in_acc = c4.number_input("配件", step=100)
+        in_profit = c1.number_input("毛利 ($)", min_value=0, step=100, help="權重 25%")
+        in_number = c2.number_input("門號 (件)", min_value=0, step=1, help="權重 20%")
+        in_insur = c3.number_input("保險營收 ($)", min_value=0, step=100, help="權重 15%")
+        in_acc = c4.number_input("配件營收 ($)", min_value=0, step=100, help="權重 15%")
+
+        # --- 第二區：硬體銷售 (權重佔比 40%) ---
+        st.subheader("📱 硬體銷售 (Hardware)")
+        h1, h2, h3, h4 = st.columns(4)
+        in_stock = h1.number_input("庫存手機 (台)", min_value=0, step=1, help="權重 15%")
+        in_vivo = h2.number_input("VIVO 手機 (台)", min_value=0, step=1, help="權重 10%")
+        in_apple = h3.number_input("🍎 蘋果手機 (台)", min_value=0, step=1, help="權重 10%")
+        in_ipad = h4.number_input("🍎 平板/手錶 (台)", min_value=0, step=1, help="權重 5%")
+
+        # --- 第三區：服務指標 (KPIs) ---
+        st.subheader("🤝 顧客經營 (Service)")
+        s1, s2, s3 = st.columns(3)
+        in_life = s1.number_input("生活圈 (件)", min_value=0, step=1)
+        in_review = s2.number_input("Google 評論 (則)", min_value=0, step=1)
+        in_traffic = s3.number_input("來客數 (人)", min_value=0, step=1)
+
+        # --- 第四區：遠傳電信指標 (Telecom Metrics) ---
+        st.subheader("📡 遠傳專案指標")
+        t1, t2, t3 = st.columns(3)
+        in_gap = t1.number_input("遠傳續約累積 GAP", step=1, help="請填寫數值")
         
-        # 這裡可以加入更多 Excel 中的欄位 (庫存、蘋果、VIVO...)
+        # 註：升續率與平續率通常是公式計算 (續約數/到期數)，但依您的需求開放手動填寫
+        in_up_rate = t2.number_input("遠傳升續率 (%)", min_value=0.0, max_value=100.0, step=0.1) / 100
+        in_flat_rate = t3.number_input("遠傳平續率 (%)", min_value=0.0, max_value=100.0, step=0.1) / 100
+
+        st.markdown("---")
         
-        submit = st.form_submit_button("提交日報表", use_container_width=True)
-        
+        # 提交按鈕
+        submit = st.form_submit_button("🚀 提交並計算分數", use_container_width=True)
+
         if submit:
+            # 1. 取得該員的目標值 (從 Session State 或預設值)
+            # 這裡先用預設值模擬，實際運作會抓 Excel 裡該員的目標
+            targets = st.session_state.targets 
+            
+            # 2. 自動計算「綜合指標」 (依照您提供的 115% 權重邏輯)
+            # 邏輯：(實際/目標) * 權重。若目標為 0 則不計分以免報錯
+            def calc_score(actual, target, weight):
+                return (actual / target * weight) if target > 0 else 0
+
+            score_profit = calc_score(in_profit, targets['毛利'], 0.25)
+            score_number = calc_score(in_number, targets['門號'], 0.20)
+            score_insur = calc_score(in_insur, targets['保險'], 0.15)
+            score_acc = calc_score(in_acc, targets['配件'], 0.15)
+            score_stock = calc_score(in_stock, targets['庫存'], 0.15)
+            score_apple = calc_score(in_apple, 10, 0.10) # 假設蘋果目標 10
+            score_ipad = calc_score(in_ipad, 4, 0.05)   # 假設平板目標 4
+            score_vivo = calc_score(in_vivo, 10, 0.10)  # 假設 VIVO 目標 10
+
+            # 綜合指標總分
+            total_score = score_profit + score_number + score_insur + score_acc + score_stock + score_apple + score_ipad + score_vivo
+
+            # 3. 建立資料物件 (完全對應 Excel 欄位順序)
             new_data = {
                 '門市': selected_store,
                 '人員': selected_user,
                 '日期': input_date,
                 '毛利': in_profit,
                 '門號': in_number,
-                '保險': in_insur,
-                '配件': in_acc,
-                '庫存': 0, '蘋果': 0, 'VIVO': 0 # 範例預設
+                '保險營收': in_insur,
+                '配件營收': in_acc,
+                '庫存手機': in_stock,
+                '蘋果手機': in_apple,
+                '蘋果平板+手錶': in_ipad,
+                'VIVO手機': in_vivo,
+                '生活圈': in_life,
+                'GOOGLE 評論': in_review,
+                '來客數': in_traffic,
+                '遠傳續約累積GAP': in_gap,
+                '遠傳升續率': in_up_rate,
+                '遠傳平續率': in_flat_rate,
+                '綜合指標': total_score  # 系統幫你算好的
             }
-            # 寫入 Session State (實際應寫入 Google Sheets)
+
+            # 4. 寫入資料庫 (模擬)
             st.session_state.records = pd.concat(
                 [st.session_state.records, pd.DataFrame([new_data])], 
                 ignore_index=True
             )
-            st.success("✅ 資料已儲存！上方儀表板已更新。")
-            st.rerun()
-
-# --- 6. 總表分析區 (Dashboard) - 只有選總表時出現 ---
-if not is_input_mode and not filtered_df.empty:
-    st.subheader("📊 詳細數據分析")
-    
-    # 依照人員/門市分組顯示
-    group_col = '人員' if selected_user == "該店總表" else '門市'
-    summary = filtered_df.groupby(group_col)[['毛利', '門號', '保險', '配件']].sum().reset_index()
-    
-    st.bar_chart(summary, x=group_col, y=['毛利', '保險', '配件'])
-    st.dataframe(summary, use_container_width=True)
-
-elif not is_input_mode:
-    st.info("尚無數據，請先至「個人頁面」輸入資料。")
+            
+            # 5. 回饋顯示
+            st.success(f"✅ 資料已儲存！")
+            
+            # 顯示綜合指標卡片
+            score_col1, score_col2 = st.columns([1, 3])
+            score_col1.metric("🏆 本日綜合指標", f"{total_score*100:.1f} 分")
+            if total_score >= 1.0:
+                score_col2.success("太棒了！今日業績達標 (100% 以上) 🎉")
+            elif total_score >= 0.8:
+                score_col2.warning("不錯喔！接近達標了 (80% - 99%)，再加油一點！ 💪")
+            else:
+                score_col2.error("今日進度落後 (<80%)，明日請補回缺口！ 🔥")
+            
+            # 顯示剛剛輸入的表格 (讓員工確認)
+            st.dataframe(pd.DataFrame([new_data]), hide_index=True)
