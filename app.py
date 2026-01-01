@@ -12,7 +12,6 @@ st.set_page_config(page_title="全店業績戰情室", layout="wide", page_icon=
 if 'preview_data' not in st.session_state: st.session_state.preview_data = None
 if 'preview_score' not in st.session_state: st.session_state.preview_score = 0
 if 'authenticated_store' not in st.session_state: st.session_state.authenticated_store = None
-# [新增] 用於暫存讀取到的報表檔案
 if 'current_excel_file' not in st.session_state: st.session_state.current_excel_file = None
 
 # 檢查必要設定
@@ -40,7 +39,7 @@ def get_drive_service():
     return build('drive', 'v3', credentials=creds)
 
 def get_file_id_in_folder(service, filename, folder_id):
-    """全域搜尋檔案，不限制在特定資料夾 ID 內"""
+    """全域搜尋檔案"""
     query = f"name = '{filename}' and trashed = false"
     results = service.files().list(q=query, fields="files(id, name)", orderBy="createdTime desc").execute()
     items = results.get('files', [])
@@ -100,7 +99,6 @@ def update_excel_drive(store, staff, date_obj, data_dict):
     except Exception as e:
         return f"❌ 系統錯誤: {str(e)}"
 
-# --- [新增] 讀取 Excel 與取得連結函式 ---
 def read_excel_drive(store, date_obj):
     """回傳：(檔案內容Bytes, 檔名, 線上連結URL)"""
     folder_id = st.secrets.get("TARGET_FOLDER_ID")
@@ -155,7 +153,7 @@ else:
 
 st.title(f"📊 {selected_store} - {selected_user}")
 
-# 權限驗證
+# 權限驗證函式
 def check_store_auth(current_store):
     # 全店總表 -> 管理員密碼
     if current_store == "(ALL) 全店總表":
@@ -198,11 +196,11 @@ if not check_store_auth(selected_store):
 if selected_store == "(ALL) 全店總表":
     st.success("✅ 管理員權限已解鎖")
     st.markdown("### 🏆 全公司業績戰情室")
-    st.info("這裡可以開發全公司彙整報表...")
+    st.info("此處未來可串接 PowerBI 或讀取所有分店 Excel 進行彙整。")
 
 elif selected_user == "該店總表":
     # ----------------------------------------------------
-    # [新功能] 門市報表檢視中心 (含線上連結)
+    # 門市報表檢視中心 (含線上連結)
     # ----------------------------------------------------
     st.markdown("### 📥 門市報表檢視中心")
     st.info("在此您可以下載、線上預覽，或直接開啟 Google 試算表。")
@@ -366,33 +364,3 @@ else:
         if col_cancel.button("❌ 有錯誤，重新填寫", use_container_width=True):
             st.session_state.preview_data = None
             st.rerun()
-            progress_text = "連線 Google Drive 中...請稍候"
-                my_bar = st.progress(0, text=progress_text)
-                
-                try:
-                    data_to_save = st.session_state.preview_data.copy()
-                    target_date = data_to_save.pop('日期')
-                    
-                    my_bar.progress(30, text="正在搜尋雲端檔案...")
-                    result_msg = update_excel_drive(selected_store, selected_user, target_date, data_to_save)
-                    my_bar.progress(100, text="處理完成！")
-                    
-                    if "✅" in result_msg:
-                        st.success(result_msg)
-                        st.balloons()
-                        st.session_state.preview_data = None
-                        st.session_state.preview_score = 0
-                        time.sleep(3)
-                        st.rerun()
-                    else:
-                        st.error(result_msg)
-                        
-                except Exception as e:
-                    st.error(f"❌ 發生未預期的錯誤: {str(e)}")
-            
-            if col_cancel.button("❌ 有錯誤，重新填寫", use_container_width=True):
-                st.session_state.preview_data = None
-                st.rerun()
-    else:
-        st.info(f"歡迎來到 {selected_store} 門市總表 (開發中)")
-
