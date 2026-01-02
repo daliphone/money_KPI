@@ -204,14 +204,71 @@ DEFAULT_TARGETS = {'毛利': 140000, '門號': 24, '保險': 28000, '配件': 35
 st.sidebar.title("🏢 門市導航")
 selected_store = st.sidebar.selectbox("請選擇門市", list(STORES.keys()))
 
-if selected_store == "(ALL) 全店總表":
-    staff_options = []
-    selected_user = "全店總覽"
-else:
-    staff_options = ["該店總表"] + STORES[selected_store]
-    selected_user = st.sidebar.selectbox("請選擇人員", staff_options)
+# --- 修改主畫面邏輯中的 (ALL) 區塊 ---
 
-st.title(f"📊 {selected_store} - {selected_user}")
+if selected_store == "(ALL) 全店總表":
+    st.markdown("### 🏆 全公司業績戰情室")
+    
+    col_date, col_refresh = st.columns([1, 4])
+    view_date = col_date.date_input("選擇檢視月份", date.today())
+    
+    # 自動讀取 (或點擊按鈕讀取)
+    if col_refresh.button("🔄 立即更新全店數據", type="primary"):
+        with st.spinner("正在彙整各分店戰報..."):
+            # 呼叫上面的彙整函式
+            df_all = aggregate_all_stores_gs(view_date)
+            
+            # 1. 頂部 KPI 卡片 (總計數據)
+            st.divider()
+            total_profit = df_all["毛利"].sum()
+            total_cases = df_all["門號"].sum()
+            avg_score = df_all["綜合指標"].mean()
+            
+            kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+            kpi1.metric("全店總毛利", f"${total_profit:,}", delta="本月累計")
+            kpi2.metric("全店總門號", f"{total_cases} 件")
+            kpi3.metric("全店平均綜合分", f"{avg_score:.1f} 分")
+            kpi4.metric("門市數量", f"{len(df_all)} 間")
+            
+            # 2. 圖表分析區 (Visuals)
+            st.subheader("📊 門市績效排行")
+            chart1, chart2 = st.columns(2)
+            
+            with chart1:
+                st.caption("各店毛利貢獻 (Profit)")
+                # 使用 Streamlit 原生長條圖，依毛利排序
+                df_sorted_profit = df_all.sort_values("毛利", ascending=False)
+                st.bar_chart(df_sorted_profit, x="門市", y="毛利", color="#FF4B4B")
+                
+            with chart2:
+                st.caption("綜合指標分數 (Score)")
+                # 使用折線圖或長條圖看分數
+                st.bar_chart(df_all, x="門市", y="綜合指標", color="#3366CC")
+
+            # 3. 詳細數據表 (Data Table with Styling)
+            st.subheader("📋 詳細數據列表")
+            
+            # 設定欄位顯示格式 (Progress Bar, Money, etc.)
+            column_cfg = {
+                "門市": st.column_config.TextColumn("門市名稱", disabled=True),
+                "毛利": st.column_config.NumberColumn("毛利", format="$%d"),
+                "門號": st.column_config.NumberColumn("門號", format="%d 件"),
+                "保險營收": st.column_config.NumberColumn("保險", format="$%d"),
+                "配件營收": st.column_config.NumberColumn("配件", format="$%d"),
+                "遠傳升續率": st.column_config.ProgressColumn("升續率", format="%.1f%%", min_value=0, max_value=1),
+                "遠傳平續率": st.column_config.ProgressColumn("平續率", format="%.1f%%", min_value=0, max_value=1),
+                "綜合指標": st.column_config.NumberColumn("綜合分數", format="%.1f 分"),
+            }
+            
+            # 顯示表格，並依照「毛利」做背景顏色深淺 (Highlight)
+            # 注意：st.dataframe 支援 pandas style，但 column_config 更現代化
+            st.dataframe(
+                df_all.style.background_gradient(subset=["毛利", "綜合指標"], cmap="Reds"),
+                column_config=column_cfg,
+                use_container_width=True,
+                hide_index=True,
+                height=400
+            )
 
 # 權限驗證函式
 def check_store_auth(current_store):
@@ -412,3 +469,4 @@ else:
         if col_no.button("❌ 取消"):
             st.session_state.preview_data = None
             st.rerun()
+
