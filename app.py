@@ -4,13 +4,14 @@ from datetime import date, datetime
 import time
 
 # --- 1. 系統初始化 ---
-st.set_page_config(page_title="全店業績戰情室", layout="wide", page_icon="📈")
+st.set_page_config(page_title="全店業績情報室", layout="wide", page_icon="📈")
 
-# 初始化 Session State
+# 初始化 Session State (修正點：補上 current_excel_file)
 if 'preview_data' not in st.session_state: st.session_state.preview_data = None
 if 'preview_score' not in st.session_state: st.session_state.preview_score = 0
 if 'authenticated_store' not in st.session_state: st.session_state.authenticated_store = None
 if 'admin_logged_in' not in st.session_state: st.session_state.admin_logged_in = False
+if 'current_excel_file' not in st.session_state: st.session_state.current_excel_file = None
 
 # 檢查 Secrets
 if "gcp_service_account" not in st.secrets:
@@ -48,8 +49,8 @@ def get_gspread_client():
 def get_sheet_id_by_name(drive_service, filename, folder_id):
     """
     在指定資料夾搜尋 Google Sheets 檔案 ID
-    注意：Google Sheets 在 Drive API 中沒有副檔名，MimeType 為 application/vnd.google-apps.spreadsheet
     """
+    # Google Sheets 的 MimeType
     query = f"name = '{filename}' and trashed = false and mimeType = 'application/vnd.google-apps.spreadsheet'"
     if folder_id:
         query += f" and '{folder_id}' in parents"
@@ -63,7 +64,7 @@ def get_sheet_id_by_name(drive_service, filename, folder_id):
 def update_google_sheet(store, staff, date_obj, data_dict):
     """直接更新 Google 試算表儲存格"""
     folder_id = st.secrets.get("TARGET_FOLDER_ID")
-    # Google Sheet 檔名通常不帶 .xlsx，這裡假設您的檔名格式為 "2026_01_東門店業績日報表"
+    # 假設檔名格式為 "2026_01_東門店業績日報表" (無副檔名)
     filename = f"{date_obj.year}_{date_obj.month:02d}_{store}業績日報表"
 
     try:
@@ -100,13 +101,6 @@ def update_google_sheet(store, staff, date_obj, data_dict):
         # 覆蓋模式的欄位
         overwrite_fields = ['遠傳續約累積GAP', '遠傳升續率', '遠傳平續率', '綜合指標']
         
-        # 5. 批次讀取舊資料以進行累加 (減少 API 呼叫次數)
-        # 讀取該列目前的數值 (假設資料在 B 到 Q 欄 -> Col 2 to 17)
-        # current_values = ws.row_values(target_row) # 這會讀整列，稍微處理一下
-        
-        # 為了精準更新，我們逐一 cell 更新 (gspread 的 batch_update 比較快，但逐格寫比較好懂)
-        # 若要追求效能，可改用 batch_update。這裡為了穩定性，先逐格檢查。
-        
         updates = []
         for field, new_val in data_dict.items():
             if field in col_map and new_val is not None:
@@ -119,14 +113,12 @@ def update_google_sheet(store, staff, date_obj, data_dict):
                         'values': [[new_val]]
                     })
                 else:
-                    # 累加模式：先讀取舊值 (注意：這會增加 API 時間，若太慢可優化)
+                    # 累加模式：先讀取舊值
                     old_val = ws.cell(target_row, col_idx).value
-                    # 處理舊值：可能是字串、None 或數字
                     try:
                         if old_val in [None, "", " "]: 
                             old_num = 0
                         else:
-                            # 移除可能的逗號或貨幣符號
                             old_num = float(str(old_val).replace(",", "").replace("$", ""))
                     except ValueError:
                         old_num = 0
@@ -187,9 +179,6 @@ def aggregate_all_stores_gs(date_obj):
 
         if file_id:
             store_stats["狀態"] = "✅ 線上"
-            # 若要進階：打開 Sheet 讀取 "總表" 分頁的加總值
-            # sh = client.open_by_key(file_id)
-            # ws = sh.worksheet("總表") ...
         
         all_data.append(store_stats)
         
@@ -290,7 +279,7 @@ elif selected_user == "該店總表":
             
             if sh_obj:
                 st.session_state.current_excel_file = {
-                    'sheet_obj': sh_obj, # 存入 Sheet 物件
+                    'sheet_obj': sh_obj, 
                     'name': file_msg,
                     'link': file_link
                 }
@@ -298,6 +287,7 @@ elif selected_user == "該店總表":
             else:
                 st.error(file_msg)
     
+    # --- 修正後的區塊 ---
     if st.session_state.current_excel_file:
         file_data = st.session_state.current_excel_file
         st.divider()
@@ -315,24 +305,21 @@ elif selected_user == "該店總表":
         st.write("#### 👀 網頁內快速預覽")
         
         try:
-            # 從 Sheet 物件讀取分頁
             sh = file_data['sheet_obj']
-            # 取得所有分頁名稱
-            # 注意：gspread 每次呼叫都是 API request，若分頁多會慢
+            # 注意：gspread 每次呼叫都是 API request
             worksheets = sh.worksheets()
             sheet_names = [ws.title for ws in worksheets]
             
             col_sheet, _ = st.columns([1, 2])
             selected_sheet_name = col_sheet.selectbox("選擇要檢視的分頁", sheet_names)
             
-            # 讀取數據
             ws = sh.worksheet(selected_sheet_name)
             data = ws.get_all_values()
             df_preview = pd.DataFrame(data)
             st.dataframe(df_preview, use_container_width=True)
             
         except Exception as e:
-            st.warning(f"預覽載入失敗 (可能是連線逾時): {str(e)}")
+            st.warning(f"預覽載入失敗: {str(e)}")
 
 else:
     # ----------------------------------------------------
@@ -345,7 +332,6 @@ else:
         input_date = d_col1.date_input("📅 報表日期", date.today())
         st.markdown("---")
 
-        # 1. 財務與門號
         st.subheader("💰 財務與門號")
         c1, c2, c3, c4 = st.columns(4)
         in_profit = c1.number_input("毛利 ($)", min_value=0, step=100)
@@ -353,7 +339,6 @@ else:
         in_insur = c3.number_input("保險營收 ($)", min_value=0, step=100)
         in_acc = c4.number_input("配件營收 ($)", min_value=0, step=100)
 
-        # 2. 硬體銷售
         st.subheader("📱 硬體銷售")
         h1, h2, h3, h4 = st.columns(4)
         in_stock = h1.number_input("庫存手機 (台)", min_value=0, step=1)
@@ -361,14 +346,12 @@ else:
         in_apple = h3.number_input("🍎 蘋果手機 (台)", min_value=0, step=1)
         in_ipad = h4.number_input("🍎 平板/手錶 (台)", min_value=0, step=1)
 
-        # 3. 顧客經營
         st.subheader("🤝 顧客經營")
         s1, s2, s3 = st.columns(3)
         in_life = s1.number_input("生活圈 (件)", min_value=0, step=1)
         in_review = s2.number_input("Google 評論 (則)", min_value=0, step=1)
         in_traffic = s3.number_input("來客數 (人)", min_value=0, step=1)
 
-        # 4. 遠傳專案
         st.subheader("📡 遠傳專案指標")
         t1, t2, t3, t4 = st.columns(4)
         in_renew = t1.number_input("遠傳續約 (件)", min_value=0, step=1)
@@ -376,15 +359,13 @@ else:
         in_up_rate_raw = t3.number_input("遠傳升續率 (%)", min_value=0.0, max_value=100.0, step=0.1)
         in_flat_rate_raw = t4.number_input("遠傳平續率 (%)", min_value=0.0, max_value=100.0, step=0.1)
         
-        # 5. 綜合
         st.subheader("🏆 綜合評估")
         in_composite = st.number_input("綜合指標分數", min_value=0.0, step=0.1)
         
         check_btn = st.form_submit_button("🔍 預覽 (Step 1)", use_container_width=True)
 
         if check_btn:
-            # 試算預覽
-            score = 0 # 暫時簡化
+            score = 0 
             st.session_state.preview_data = {
                 '毛利': in_profit, '門號': in_number, '保險營收': in_insur, '配件營收': in_acc,
                 '庫存手機': in_stock, '蘋果手機': in_apple, '蘋果平板+手錶': in_ipad, 'VIVO手機': in_vivo,
