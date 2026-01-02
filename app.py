@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import openpyxl
 from io import BytesIO
-from datetime import date
+from datetime import date, datetime
 import time
 
 # --- 1. 系統初始化 ---
@@ -13,6 +13,7 @@ if 'preview_data' not in st.session_state: st.session_state.preview_data = None
 if 'preview_score' not in st.session_state: st.session_state.preview_score = 0
 if 'authenticated_store' not in st.session_state: st.session_state.authenticated_store = None
 if 'current_excel_file' not in st.session_state: st.session_state.current_excel_file = None
+if 'admin_logged_in' not in st.session_state: st.session_state.admin_logged_in = False
 
 # 檢查必要設定
 if "gcp_service_account" not in st.secrets:
@@ -41,6 +42,10 @@ def get_drive_service():
 def get_file_id_in_folder(service, filename, folder_id):
     """全域搜尋檔案"""
     query = f"name = '{filename}' and trashed = false"
+    # 增加 parents 查詢以確保在正確資料夾
+    if folder_id:
+        query += f" and '{folder_id}' in parents"
+        
     results = service.files().list(q=query, fields="files(id, name)", orderBy="createdTime desc").execute()
     items = results.get('files', [])
     if not items: return None
@@ -66,25 +71,44 @@ def update_excel_drive(store, staff, date_obj, data_dict):
             return f"❌ 找不到人員分頁：[{staff}]"
         
         ws = wb[staff]
+        # 假設第 15 列是 1 號，則當日列數為 15 + (日期 - 1)
         target_row = 15 + (date_obj.day - 1)
         
+        # 定義欄位對應 (依據 Excel 實際欄位順序調整)
         col_map = {
-            '毛利': 2, '門號': 3, '保險營收': 4, '配件營收': 5,
-            '庫存手機': 6, '蘋果手機': 7, '蘋果平板+手錶': 8, 'VIVO手機': 9,
-            '生活圈': 10, 'GOOGLE 評論': 11, '來客數': 12,
-            '遠傳續約累積GAP': 13, '遠傳升續率': 14, '遠傳平續率': 15
+            '毛利': 2, 
+            '門號': 3, 
+            '保險營收': 4, 
+            '配件營收': 5,
+            '庫存手機': 6, 
+            '蘋果手機': 7, 
+            '蘋果平板+手錶': 8, 
+            'VIVO手機': 9,
+            '生活圈': 10, 
+            'GOOGLE 評論': 11, 
+            '來客數': 12,
+            '遠傳續約': 13,        # 新增
+            '遠傳續約累積GAP': 14, # 順延
+            '遠傳升續率': 15,      # 順延
+            '遠傳平續率': 16,      # 順延
+            '綜合指標': 17         # 新增
         }
-        overwrite_fields = ['遠傳續約累積GAP', '遠傳升續率', '遠傳平續率']
+        
+        # 這些欄位是直接覆蓋數值 (不是累加)
+        overwrite_fields = ['遠傳續約累積GAP', '遠傳升續率', '遠傳平續率', '綜合指標']
         
         for field, new_val in data_dict.items():
             if field in col_map and new_val is not None:
                 col_idx = col_map[field]
                 cell = ws.cell(row=target_row, column=col_idx)
+                
+                # 讀取舊值 (若非數值則設為 0)
                 old_val = cell.value if isinstance(cell.value, (int, float)) else 0
                 
                 if field in overwrite_fields:
                     cell.value = new_val
                 else:
+                    # 其他欄位採累加模式 (可依需求改為覆蓋)
                     cell.value = old_val + new_val
 
         output_stream = BytesIO()
@@ -124,6 +148,43 @@ def read_excel_drive(store, date_obj):
     except Exception as e:
         return None, str(e), None
 
+def aggregate_all_stores(date_obj):
+    """(新增功能) 彙整所有分店當月數據"""
+    folder_id = st.secrets.get("TARGET_FOLDER_ID")
+    service = get_drive_service()
+    
+    all_data = []
+    
+    # 遍歷所有分店
+    for store_name in STORES.keys():
+        if store_name == "(ALL) 全店總表": continue
+        
+        filename = f"{date_obj.year}_{date_obj.month:02d}_{store_name}業績日報表.xlsx"
+        file_id = get_file_id_in_folder(service, filename, folder_id)
+        
+        store_stats = {
+            "門市": store_name,
+            "毛利": 0, "門號": 0, "保險營收": 0, "配件營收": 0,
+            "來客數": 0, "遠傳續約": 0, "綜合指標": 0,
+            "連結": None
+        }
+
+        if file_id:
+            # 取得連結
+            meta = service.files().get(fileId=file_id, fields='webViewLink').execute()
+            store_stats["連結"] = meta.get('webViewLink')
+            
+            # 讀取內容進行簡單加總 (這裡只示範讀取 '總表' 分頁的最後一列，或是累加所有人員)
+            # 為了效能，這裡暫時只讀取檔案存在與否，若要深入讀取數值需下載每個 Excel
+            # 這裡示範：標記為「已讀取」
+            store_stats["狀態"] = "✅ 線上"
+        else:
+            store_stats["狀態"] = "❌ 未建立"
+            
+        all_data.append(store_stats)
+        
+    return pd.DataFrame(all_data)
+
 # --- 3. 組織與目標 ---
 STORES = {
     "(ALL) 全店總表": [],
@@ -137,6 +198,7 @@ STORES = {
     "五甲店": ["阿凱", "孟婧", "支援", "人員2"],
     "鳳山店": ["店長", "組員"]
 }
+# 預設目標 (可依需求調整)
 DEFAULT_TARGETS = {'毛利': 140000, '門號': 24, '保險': 28000, '配件': 35000, '庫存': 21}
 
 # --- 4. 介面與權限邏輯 ---
@@ -157,12 +219,12 @@ st.title(f"📊 {selected_store} - {selected_user}")
 def check_store_auth(current_store):
     # 全店總表 -> 管理員密碼
     if current_store == "(ALL) 全店總表":
-        if st.session_state.get("admin_logged_in", False): return True
+        if st.session_state.admin_logged_in: return True
         st.info("🛡️ 此區域需要管理員權限")
         admin_input = st.text_input("🔑 請輸入管理員密碼", type="password", key="admin_input")
         if st.button("驗證管理員"):
             if admin_input == st.secrets.get("admin_password"):
-                st.session_state["admin_logged_in"] = True
+                st.session_state.admin_logged_in = True
                 st.rerun()
             else:
                 st.error("❌ 密碼錯誤")
@@ -196,7 +258,21 @@ if not check_store_auth(selected_store):
 if selected_store == "(ALL) 全店總表":
     st.success("✅ 管理員權限已解鎖")
     st.markdown("### 🏆 全公司業績戰情室")
-    st.info("此處未來可串接 PowerBI 或讀取所有分店 Excel 進行彙整。")
+    
+    col_date, _ = st.columns([1, 3])
+    view_date = col_date.date_input("選擇檢視月份", date.today())
+    
+    if st.button("🔄 讀取全部分店數據"):
+        with st.spinner("正在連線各分店報表..."):
+            df_all_stores = aggregate_all_stores(view_date)
+            st.dataframe(
+                df_all_stores, 
+                column_config={
+                    "連結": st.column_config.LinkColumn("雲端檔案")
+                },
+                use_container_width=True
+            )
+            st.caption("💡 提示：點擊連結可直接開啟各店原始 Excel 檔")
 
 elif selected_user == "該店總表":
     # ----------------------------------------------------
@@ -280,6 +356,7 @@ else:
         input_date = d_col1.date_input("📅 報表日期", date.today())
         st.markdown("---")
 
+        # 1. 財務與門號
         st.subheader("💰 財務與門號 (Core)")
         c1, c2, c3, c4 = st.columns(4)
         in_profit = c1.number_input("毛利 ($)", min_value=0, step=100)
@@ -287,6 +364,7 @@ else:
         in_insur = c3.number_input("保險營收 ($)", min_value=0, step=100)
         in_acc = c4.number_input("配件營收 ($)", min_value=0, step=100)
 
+        # 2. 硬體銷售
         st.subheader("📱 硬體銷售 (Hardware)")
         h1, h2, h3, h4 = st.columns(4)
         in_stock = h1.number_input("庫存手機 (台)", min_value=0, step=1)
@@ -294,21 +372,29 @@ else:
         in_apple = h3.number_input("🍎 蘋果手機 (台)", min_value=0, step=1)
         in_ipad = h4.number_input("🍎 平板/手錶 (台)", min_value=0, step=1)
 
+        # 3. 顧客經營
         st.subheader("🤝 顧客經營 (Service)")
         s1, s2, s3 = st.columns(3)
         in_life = s1.number_input("生活圈 (件)", min_value=0, step=1)
         in_review = s2.number_input("Google 評論 (則)", min_value=0, step=1)
         in_traffic = s3.number_input("來客數 (人)", min_value=0, step=1)
 
-        st.subheader("📡 遠傳專案指標 (覆蓋)")
-        t1, t2, t3 = st.columns(3)
-        in_gap = t1.number_input("遠傳續約累積 GAP", step=1)
-        in_up_rate_raw = t2.number_input("遠傳升續率 (%)", min_value=0.0, max_value=100.0, step=0.1)
-        in_flat_rate_raw = t3.number_input("遠傳平續率 (%)", min_value=0.0, max_value=100.0, step=0.1)
+        # 4. 遠傳專案指標
+        st.subheader("📡 遠傳專案指標 (KPI)")
+        t1, t2, t3, t4 = st.columns(4)
+        in_renew = t1.number_input("遠傳續約 (件)", min_value=0, step=1)
+        in_gap = t2.number_input("遠傳續約累積 GAP", step=1)
+        in_up_rate_raw = t3.number_input("遠傳升續率 (%)", min_value=0.0, max_value=100.0, step=0.1)
+        in_flat_rate_raw = t4.number_input("遠傳平續率 (%)", min_value=0.0, max_value=100.0, step=0.1)
+        
+        # 5. 綜合指標
+        st.subheader("🏆 綜合評估")
+        in_composite = st.number_input("綜合指標分數", min_value=0.0, step=0.1)
         
         check_btn = st.form_submit_button("🔍 試算分數並預覽 (Step 1)", use_container_width=True)
 
         if check_btn:
+            # 簡易試算邏輯 (可自訂)
             def calc(act, tgt, w): return (act / tgt * w) if tgt > 0 else 0
             score = (
                 calc(in_profit, DEFAULT_TARGETS['毛利'], 0.25) + 
@@ -322,9 +408,11 @@ else:
                 '毛利': in_profit, '門號': in_number, '保險營收': in_insur, '配件營收': in_acc,
                 '庫存手機': in_stock, '蘋果手機': in_apple, '蘋果平板+手錶': in_ipad, 'VIVO手機': in_vivo,
                 '生活圈': in_life, 'GOOGLE 評論': in_review, '來客數': in_traffic,
+                '遠傳續約': in_renew,
                 '遠傳續約累積GAP': in_gap, 
                 '遠傳升續率': in_up_rate_raw / 100, 
                 '遠傳平續率': in_flat_rate_raw / 100,
+                '綜合指標': in_composite,
                 '日期': input_date
             }
             st.session_state.preview_score = score
@@ -333,10 +421,24 @@ else:
     if st.session_state.preview_data:
         st.divider()
         st.markdown("### 👀 請確認下方資料是否正確？")
+        
+        # 顯示預覽表格，並格式化百分比
         df_preview = pd.DataFrame([st.session_state.preview_data])
-        st.dataframe(df_preview, hide_index=True)
+        # 隱藏日期欄位以免混淆
+        display_df = df_preview.drop(columns=['日期'])
+        
+        st.dataframe(
+            display_df, 
+            hide_index=True,
+            column_config={
+                "遠傳升續率": st.column_config.NumberColumn(format="%.1f%%"),
+                "遠傳平續率": st.column_config.NumberColumn(format="%.1f%%"),
+                "毛利": st.column_config.NumberColumn(format="$%d"),
+            }
+        )
+        
         if st.session_state.preview_score > 0:
-            st.info(f"💡 預估綜合指標貢獻：{st.session_state.preview_score*100:.1f} 分")
+            st.info(f"💡 系統試算核心貢獻度：{st.session_state.preview_score*100:.1f} 分 (僅供參考)")
         
         col_confirm, col_cancel = st.columns([1, 1])
         if col_confirm.button("✅ 確認無誤，立即上傳 (Step 2)", type="primary", use_container_width=True):
@@ -346,6 +448,7 @@ else:
                 data_to_save = st.session_state.preview_data.copy()
                 target_date = data_to_save.pop('日期')
                 my_bar.progress(30, text="正在搜尋雲端檔案...")
+                
                 result_msg = update_excel_drive(selected_store, selected_user, target_date, data_to_save)
                 my_bar.progress(100, text="處理完成！")
                 
