@@ -1,209 +1,219 @@
 import streamlit as st
 import pandas as pd
 from datetime import datetime
-import io
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload
 
 # ==========================================
-# 1. 系統設定與連線準備
+# 1. 系統設定
 # ==========================================
-
 st.set_page_config(
     page_title="馬尼通訊 - 營運管理系統",
-    page_icon="📱",
-    layout="wide"
+    page_icon="📈",
+    layout="wide"  # 改為寬螢幕模式以容納總表
 )
 
-# 分店清單 (請確保這裡的店名與您的 Excel 檔名一致)
-STORE_LIST = ["東門店", "西門店", "南門店", "北門店"]
+# --- 樣式設定 ---
+st.markdown("""
+    <style>
+    .big-font { font-size:20px !important; font-weight: bold; }
+    .stButton>button { width: 100%; background-color: #FF4B4B; color: white; }
+    /* 調整 Sidebar 樣式 */
+    section[data-testid="stSidebar"] {
+        background-color: #f0f2f6;
+    }
+    </style>
+    """, unsafe_allow_html=True)
 
-# 需填寫的 15 項營運目標
-INPUT_ITEMS = [
-    "毛利", "門號", "保險營收", "配件營收", "庫存手機",
-    "蘋果手機", "蘋果平板+手錶", "VIVO手機", "生活圈", "GOOGLE 評論",
-    "來客數", "遠傳續約", "累積GAP", "遠傳升續率", "遠傳平續率"
+# ==========================================
+# 2. 資料定義 (16項完整指標)
+# ==========================================
+KPI_ITEMS = [
+    "毛利",
+    "門號",
+    "保險營收",
+    "配件營收",
+    "庫存手機",
+    "蘋果手機",
+    "蘋果平板+手錶",
+    "VIVO手機",
+    "生活圈",
+    "GOOGLE 評論",
+    "來客數",       # 新增
+    "遠傳續約",     # 新增
+    "累積GAP",      # 新增
+    "遠傳升續率",   # 新增
+    "遠傳平續率",   # 新增
+    "綜合指標"      # 新增
 ]
 
-# --- Google Drive API 連線函式 ---
-def get_drive_service():
-    """建立 Google Drive API 服務"""
-    if "gcp_service_account" not in st.secrets:
-        st.error("找不到 GCP 憑證，請檢查 secrets.toml")
-        return None
-    
-    creds_dict = dict(st.secrets["gcp_service_account"])
-    creds = service_account.Credentials.from_service_account_info(
-        creds_dict,
-        scopes=["https://www.googleapis.com/auth/drive"]
-    )
-    return build("drive", "v3", credentials=creds)
+# 模擬雲端檔案連結 (請替換成您真實的 Google Drive 連結)
+GOOGLE_DRIVE_LINK = "https://docs.google.com/spreadsheets/d/YOUR_FILE_ID_HERE"
 
 # ==========================================
-# 2. 核心功能：讀寫 Google Drive Excel
+# 3. 頁面功能函式
 # ==========================================
 
-def save_to_drive_excel(store_name, staff_name, target_date, data_df):
-    """
-    邏輯 A 實作：
-    1. 根據 secrets 中的 TARGET_FOLDER_ID 搜尋檔案。
-    2. 下載 Excel -> 寫入新資料 -> 更新回 Drive。
-    """
-    drive_service = get_drive_service()
-    if not drive_service:
-        return False
+def render_goal_setting():
+    """頁面 1: 門市人員目標分配"""
+    st.title("🎯 馬尼通訊 - 門市人員目標分配")
+    st.write("請依照下方項目填寫本月個人目標。")
 
-    folder_id = st.secrets["TARGET_FOLDER_ID"]
-    
-    # 組合目標檔名：例如 "2025_12_東門店業績日報表.xlsx"
-    # 這裡假設您的檔名格式是 YYYY_MM_店名業績日報表.xlsx
-    file_year = target_date.strftime("%Y")
-    file_month = target_date.strftime("%m")
-    target_filename = f"{file_year}_{file_month}_{store_name}業績日報表.xlsx"
-    
-    status_text = st.empty()
-    status_text.info(f"🔍 正在資料夾中搜尋：{target_filename} ...")
+    # 1. 基本資料區
+    with st.container():
+        col1, col2 = st.columns(2)
+        with col1:
+            staff_name = st.text_input("人員姓名", placeholder="請輸入姓名")
+        with col2:
+            target_month = st.date_input("設定月份", value=datetime.now())
 
-    try:
-        # 1. 搜尋檔案
-        query = f"'{folder_id}' in parents and name = '{target_filename}' and trashed = false"
-        results = drive_service.files().list(q=query, fields="files(id, name)").execute()
-        files = results.get("files", [])
-
-        if not files:
-            st.error(f"❌ 找不到檔案：{target_filename}。請確認 Google Drive 資料夾 ID 正確，且檔案已建立。")
-            return False
-        
-        file_id = files[0]['id']
-        status_text.info(f"📥 找到檔案 (ID: {file_id})，正在下載並寫入資料...")
-
-        # 2. 下載檔案到記憶體
-        request = drive_service.files().get_media(fileId=file_id)
-        file_content = io.BytesIO(request.execute())
-
-        # 3. 使用 Pandas 處理 Excel (寫入邏輯)
-        # 我們將資料寫入一個名為 "目標分配紀錄" 的分頁，以免覆蓋原始報表
-        try:
-            # 嘗試讀取現有 Excel
-            # 注意：這裡使用 openpyxl 引擎來處理 .xlsx
-            with pd.ExcelWriter(file_content, engine="openpyxl", mode="a", if_sheet_exists="overlay") as writer:
-                
-                # 準備要寫入的資料：加入填寫人與時間戳記
-                data_df["填寫人"] = staff_name
-                data_df["填寫日期"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                data_df["目標月份"] = target_date.strftime("%Y-%m")
-                
-                # 重新排列欄位，把資訊放前面
-                cols = ["目標月份", "填寫日期", "填寫人", "評估項目", "目標/數值", "備註"]
-                final_df = data_df[cols]
-
-                # 寫入名為 "人員目標_Log" 的分頁 (如果不存在會自動建立，存在則附加)
-                # 由於 ExcelWriter 的 append 模式比較複雜，這裡簡化為：
-                # 如果分頁已存在，算出列數往下寫；如果不存在，寫在第一列。
-                
-                sheet_name = "人員目標_Log"
-                start_row = 0
-                header = True
-                
-                if sheet_name in writer.book.sheetnames:
-                    start_row = writer.book[sheet_name].max_row
-                    header = False # 附加模式不重複寫入標題
-
-                final_df.to_excel(writer, sheet_name=sheet_name, startrow=start_row, index=False, header=header)
-            
-            # 4. 上傳更新後的檔案回 Google Drive
-            status_text.info("📤 資料寫入完成，正在上傳更新檔...")
-            file_content.seek(0) # 重置指標
-            
-            media = MediaIoBaseUpload(
-                file_content, 
-                mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                resumable=True
-            )
-            
-            updated_file = drive_service.files().update(
-                fileId=file_id,
-                media_body=media
-            ).execute()
-            
-            status_text.success(f"✅ 成功！已將 {staff_name} 的目標更新至 {target_filename}")
-            return True
-
-        except Exception as e:
-            st.error(f"Excel 處理失敗：{str(e)}")
-            return False
-
-    except Exception as e:
-        st.error(f"Google Drive 連線失敗：{str(e)}")
-        return False
-
-# ==========================================
-# 3. 介面渲染函式 (維持原本邏輯)
-# ==========================================
-
-def render_store_tab(store_name):
-    # --- 頂部功能區 ---
-    # 這裡可以根據 store_name 產生動態連結 (如果需要的話)
-    st.caption(f"目前操作門市：**{store_name}**")
     st.markdown("---")
 
-    # --- 填寫表單區 ---
-    st.subheader(f"📝 {store_name} - 營運目標分配")
-    
-    c1, c2 = st.columns(2)
-    with c1:
-        staff_name = st.text_input("填寫人員姓名", placeholder="請輸入姓名", key=f"staff_{store_name}")
-    with c2:
-        # 預設為當月
-        target_month = st.date_input("設定月份", value=datetime.now(), key=f"date_{store_name}")
-
-    # 資料結構初始化
-    data_key = f'input_data_{store_name}'
-    if data_key not in st.session_state:
-        st.session_state[data_key] = pd.DataFrame({
-            "評估項目": INPUT_ITEMS,
-            "目標/數值": [0] * len(INPUT_ITEMS),
-            "備註": [""] * len(INPUT_ITEMS)
+    # 2. 建立資料結構
+    if 'goal_data' not in st.session_state:
+        st.session_state.goal_data = pd.DataFrame({
+            "評估項目": KPI_ITEMS,
+            "目標設定值": [0] * len(KPI_ITEMS),
+            "備註": [""] * len(KPI_ITEMS)
         })
 
-    # 顯示編輯表
+    # 3. 顯示輸入介面 (Data Editor)
+    st.subheader("📝 目標數值填寫")
+    
     column_config = {
-        "評估項目": st.column_config.TextColumn("評估項目", disabled=True),
-        "目標/數值": st.column_config.NumberColumn("目標數值", min_value=0, required=True),
-        "備註": st.column_config.TextColumn("備註", width="large")
+        "評估項目": st.column_config.TextColumn(
+            "評估項目", disabled=True, width="medium"
+        ),
+        "目標設定值": st.column_config.NumberColumn(
+            "目標數值 / 百分比",
+            help="金額、件數或百分比 (如 80 代表 80%)",
+            min_value=0,
+            step=1,
+            required=True
+        ),
+        "備註": st.column_config.TextColumn(
+            "備註說明", width="large"
+        )
     }
 
     edited_df = st.data_editor(
-        st.session_state[data_key],
+        st.session_state.goal_data,
         column_config=column_config,
         hide_index=True,
         use_container_width=True,
         num_rows="fixed",
-        key=f"editor_{store_name}"
+        height=600 # 拉高表格以容納 16 個項目
     )
 
-    st.markdown("<br>", unsafe_allow_html=True)
-    if st.button(f"確認上傳 ({store_name})", use_container_width=True, key=f"btn_upload_{store_name}"):
+    st.info("💡 提示：百分比項目 (如升續率) 請直接輸入數字 (例如 80)。")
+
+    # 4. 送出按鈕
+    if st.button("確認儲存目標", use_container_width=True):
         if not staff_name:
             st.warning("⚠️ 請務必填寫人員姓名！")
         else:
-            # 呼叫上面寫好的 save_to_drive_excel 函式
-            save_to_drive_excel(store_name, staff_name, target_month, edited_df)
+            st.success(f"✅ {staff_name} 的 {target_month.strftime('%Y年%m月')} 目標已成功設定！")
+            
+            # 結果預覽
+            st.markdown("### 📊 設定結果預覽")
+            result_view = edited_df.set_index("評估項目")["目標設定值"]
+            
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("預估毛利", f"{result_view['毛利']:,}")
+            c2.metric("門號件數", f"{result_view['門號']}")
+            c3.metric("遠傳升續率", f"{result_view['遠傳升續率']}%")
+            c4.metric("綜合指標", f"{result_view['綜合指標']}")
+
+            with st.expander("查看完整列表"):
+                st.table(edited_df)
+
+def render_all_overview():
+    """頁面 2: (ALL) 全店總表"""
+    st.title("📊 (ALL) 全店總表 - 營運總覽")
+    
+    # 功能列：開啟雲端檔案
+    col_btn, col_info = st.columns([1, 4])
+    with col_btn:
+        st.link_button("🔗 開啟雲端原始檔", GOOGLE_DRIVE_LINK, use_container_width=True)
+    with col_info:
+        st.caption("點擊按鈕可直接前往 Google Drive 查看詳細報表與公式。")
+
+    st.markdown("---")
+
+    # 模擬全店數據 (實際應用時這裡應從 Google Sheet 讀取)
+    # 這裡建立一個包含所有 16 項指標的範例資料
+    mock_data = {
+        "門市": ["東門店", "西門店", "南門店", "北門店", "全店總計"],
+        "毛利": [150000, 120000, 130000, 180000, 580000],
+        "門號": [20, 15, 18, 25, 78],
+        "保險營收": [5000, 3000, 4000, 6000, 18000],
+        "配件營收": [30000, 25000, 28000, 35000, 118000],
+        "庫存手機": [5, 3, 4, 6, 18],
+        "蘋果手機": [10, 8, 9, 12, 39],
+        "蘋果平板+手錶": [2, 1, 2, 3, 8],
+        "VIVO手機": [5, 4, 4, 6, 19],
+        "生活圈": [80, 70, 75, 90, 315],
+        "GOOGLE 評論": [4.9, 4.8, 4.7, 5.0, 4.85],
+        "來客數": [150, 120, 130, 180, 580],
+        "遠傳續約": [10, 8, 9, 12, 39],
+        "累積GAP": [2, 1, 1, 0, 4],
+        "遠傳升續率": [80, 75, 78, 85, 80], # 顯示為數字，呈現時加 %
+        "遠傳平續率": [90, 88, 89, 92, 90],
+        "綜合指標": [95, 88, 90, 98, 93]    # 假設為分數
+    }
+    
+    df_all = pd.DataFrame(mock_data)
+
+    # 顯示總表 (DataFrame)
+    st.subheader("各門市詳細數據")
+    
+    # 設定欄位顯示格式
+    column_config = {
+        "門市": st.column_config.TextColumn("門市名稱", disabled=True),
+        "毛利": st.column_config.NumberColumn("毛利", format="$%d"),
+        "保險營收": st.column_config.NumberColumn("保險營收", format="$%d"),
+        "配件營收": st.column_config.NumberColumn("配件營收", format="$%d"),
+        "遠傳升續率": st.column_config.ProgressColumn("升續率", format="%d%%", min_value=0, max_value=100),
+        "遠傳平續率": st.column_config.ProgressColumn("平續率", format="%d%%", min_value=0, max_value=100),
+        "綜合指標": st.column_config.NumberColumn("綜合指標", format="%d 分"),
+    }
+
+    st.dataframe(
+        df_all,
+        column_config=column_config,
+        use_container_width=True,
+        hide_index=True,
+        height=300
+    )
+
+    # 重點指標 Dashboard
+    st.subheader("重點指標速覽")
+    total_row = df_all.iloc[-1] # 取最後一行總計
+    
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("全店總毛利", f"${total_row['毛利']:,}")
+    m2.metric("總來客數", f"{total_row['來客數']} 人")
+    m3.metric("總門號數", f"{total_row['門號']} 件")
+    m4.metric("平均升續率", f"{total_row['遠傳升續率']}%")
+    m5.metric("綜合指標", f"{total_row['綜合指標']} 分")
 
 # ==========================================
-# 4. 主程式
+# 4. 主程式 (導覽控制)
 # ==========================================
-
 def main():
-    st.title("📱 馬尼通訊 - 目標分配 (Drive版)")
+    # 側邊導覽列
+    with st.sidebar:
+        st.header("馬尼通訊系統")
+        page = st.radio(
+            "請選擇功能頁面：",
+            ["🎯 門市目標分配", "📊 (ALL) 全店總表"]
+        )
+        st.markdown("---")
+        st.caption("Version 2.0")
 
-    # 簡單用分頁顯示各店
-    tabs = st.tabs(STORE_LIST)
-
-    for i, store_name in enumerate(STORE_LIST):
-        with tabs[i]:
-            render_store_tab(store_name)
+    # 根據選擇渲染對應頁面
+    if page == "🎯 門市目標分配":
+        render_goal_setting()
+    elif page == "📊 (ALL) 全店總表":
+        render_all_overview()
 
 if __name__ == "__main__":
     main()
