@@ -44,6 +44,7 @@ def get_gspread_client():
     return client, drive_service
 
 def get_sheet_id_by_name(drive_service, filename, folder_id):
+    """搜尋檔案 ID"""
     query = f"name = '{filename}' and trashed = false and mimeType = 'application/vnd.google-apps.spreadsheet'"
     if folder_id:
         query += f" and '{folder_id}' in parents" 
@@ -52,7 +53,16 @@ def get_sheet_id_by_name(drive_service, filename, folder_id):
     if not items: return None, None
     return items[0]['id'], items[0]['webViewLink']
 
+def safe_float(value):
+    """將表格內容轉為浮點數，失敗回傳 0"""
+    try:
+        if value in [None, "", " "]: return 0.0
+        return float(str(value).replace(",", "").replace("$", "").replace("%", ""))
+    except ValueError:
+        return 0.0
+
 def update_google_sheet(store, staff, date_obj, data_dict):
+    """寫入單一門市單一人員數據"""
     folder_id = st.secrets.get("TARGET_FOLDER_ID")
     filename = f"{date_obj.year}_{date_obj.month:02d}_{store}業績日報表"
 
@@ -86,14 +96,9 @@ def update_google_sheet(store, staff, date_obj, data_dict):
                 if field in overwrite_fields:
                     updates.append({'range': gspread.utils.rowcol_to_a1(target_row, col_idx), 'values': [[new_val]]})
                 else:
-                    # 讀取舊值
+                    # 讀取舊值累加
                     old_val = ws.cell(target_row, col_idx).value
-                    try:
-                        if old_val in [None, "", " "]: old_num = 0
-                        else: old_num = float(str(old_val).replace(",", "").replace("$", ""))
-                    except ValueError: old_num = 0
-                    
-                    final_val = old_num + new_val
+                    final_val = safe_float(old_val) + new_val
                     updates.append({'range': gspread.utils.rowcol_to_a1(target_row, col_idx), 'values': [[final_val]]})
 
         if updates: ws.batch_update(updates)
@@ -115,27 +120,100 @@ def read_google_sheet_data(store, date_obj):
         return None, str(e), None
 
 def aggregate_all_stores_gs(date_obj):
-    """彙整所有分店數據 (模擬數據演示版)"""
-    import random
+    """
+    (真實版) 彙整所有分店數據
+    會開啟每一家分店的試算表，將該店所有人員當日數據加總。
+    """
+    folder_id = st.secrets.get("TARGET_FOLDER_ID")
+    client, drive_service = get_gspread_client()
+    
     all_data = []
-    for store_name in STORES.keys():
+    
+    # 定義要加總的欄位索引 (Excel 中的 Column B=2, C=3...)
+    # 這裡我們只抓取重點數據進行加總展示
+    metrics_indices = {
+        "毛利": 2, "門號": 3, "保險營收": 4, "配件營收": 5, "綜合指標": 17
+    }
+    
+    target_row = 15 + (date_obj.day - 1)
+
+    # 進度條
+    prog_bar = st.progress(0, text="開始彙整...")
+    total_steps = len(STORES) - 1 # 扣掉 ALL
+    current_step = 0
+
+    for store_name, staff_list in STORES.items():
         if store_name == "(ALL) 全店總表": continue
         
-        # 這裡未來可改為真實讀取
-        simulated_profit = random.randint(100000, 300000)
-        simulated_cases = random.randint(10, 50)
-        simulated_score = random.uniform(80, 99)
+        current_step += 1
+        prog_bar.progress(int(current_step / total_steps * 100), text=f"正在讀取：{store_name}...")
+        
+        filename = f"{date_obj.year}_{date_obj.month:02d}_{store_name}業績日報表"
+        file_id, file_url = get_sheet_id_by_name(drive_service, filename, folder_id)
         
         store_stats = {
             "門市": store_name,
-            "毛利": simulated_profit, "門號": simulated_cases, 
-            "保險營收": random.randint(5000, 20000), "配件營收": random.randint(20000, 50000),
-            "來客數": random.randint(100, 300),
-            "遠傳升續率": random.uniform(0.6, 0.95),
-            "遠傳平續率": random.uniform(0.7, 0.98),
-            "綜合指標": simulated_score
+            "毛利": 0, "門號": 0, "保險營收": 0, "配件營收": 0, "綜合指標": 0,
+            "狀態": "❌ 缺檔"
         }
+
+        if file_id:
+            try:
+                sh = client.open_by_key(file_id)
+                store_stats["狀態"] = "✅ 正常"
+                
+                # 遍歷該店所有人員進行加總
+                # 注意：這會比較慢，因為要開多個分頁。為了效能，這裡假設 Excel 有一個 "總表" 分頁
+                # 如果您的 Excel 已經有公式自動算總表，讀總表最快。
+                # 如果沒有，我們必須讀每個人的分頁。
+                
+                # 方案 A：嘗試讀取 '總表' 或 '總計' 分頁 (最快)
+                summary_sheet = None
+                for possible_name in ["總表", "總計", "TOTAL", "Total"]:
+                    try:
+                        summary_sheet = sh.worksheet(possible_name)
+                        break
+                    except: pass
+                
+                if summary_sheet:
+                    # 直接讀取總表的該日數據
+                    row_vals = summary_sheet.row_values(target_row)
+                    # row_vals 是 list，index 0 對應 Col A
+                    # 毛利 Col 2 -> index 1
+                    if len(row_vals) >= 17:
+                        store_stats["毛利"] = safe_float(row_vals[1])
+                        store_stats["門號"] = safe_float(row_vals[2])
+                        store_stats["保險營收"] = safe_float(row_vals[3])
+                        store_stats["配件營收"] = safe_float(row_vals[4])
+                        store_stats["綜合指標"] = safe_float(row_vals[16])
+                else:
+                    # 方案 B：若無總表，則加總所有人員 (較慢，但準確)
+                    for staff in staff_list:
+                        try:
+                            ws = sh.worksheet(staff)
+                            val_profit = safe_float(ws.cell(target_row, 2).value)
+                            val_num = safe_float(ws.cell(target_row, 3).value)
+                            val_ins = safe_float(ws.cell(target_row, 4).value)
+                            val_acc = safe_float(ws.cell(target_row, 5).value)
+                            val_score = safe_float(ws.cell(target_row, 17).value)
+                            
+                            store_stats["毛利"] += val_profit
+                            store_stats["門號"] += val_num
+                            store_stats["保險營收"] += val_ins
+                            store_stats["配件營收"] += val_acc
+                            # 綜合指標通常是平均或加總？這裡先用平均
+                            if store_stats["綜合指標"] == 0: store_stats["綜合指標"] = val_score
+                            else: store_stats["綜合指標"] = (store_stats["綜合指標"] + val_score) / 2
+                        except:
+                            pass # 該人員分頁不存在跳過
+
+            except Exception as e:
+                store_stats["狀態"] = "⚠️ 讀取錯"
+                print(e)
+        
         all_data.append(store_stats)
+    
+    prog_bar.empty()
     return pd.DataFrame(all_data)
 
 # --- 3. 組織與目標 ---
@@ -152,22 +230,19 @@ STORES = {
     "鳳山店": ["店長", "組員"]
 }
 
-# --- 4. 介面與權限邏輯 (修正重點) ---
+# --- 4. 介面與權限邏輯 ---
 
 st.sidebar.title("🏢 門市導航")
 
 # 4.1 選擇門市
-# 加入 key 避免重複 ID
 selected_store = st.sidebar.selectbox("請選擇門市", list(STORES.keys()), key="sidebar_store_select")
 
-# 4.2 選擇人員 (這裡進行 NameError 修正)
-# 確保 selected_user 無論如何都有值
+# 4.2 選擇人員
 if selected_store == "(ALL) 全店總表":
     selected_user = "全店總覽"
     staff_options = []
 else:
     staff_options = ["該店總表"] + STORES[selected_store]
-    # 加入 key
     selected_user = st.sidebar.selectbox("請選擇人員", staff_options, key="sidebar_user_select")
 
 st.title(f"📊 {selected_store} - {selected_user}")
@@ -177,8 +252,8 @@ def check_store_auth(current_store):
     if current_store == "(ALL) 全店總表":
         if st.session_state.admin_logged_in: return True
         st.info("🛡️ 此區域需要管理員權限")
-        admin_input = st.text_input("🔑 請輸入管理員密碼", type="password", key="auth_admin_pass") # Key
-        if st.button("驗證管理員", key="btn_auth_admin"): # Key
+        admin_input = st.text_input("🔑 請輸入管理員密碼", type="password", key="auth_admin_pass") 
+        if st.button("驗證管理員", key="btn_auth_admin"): 
             if admin_input == st.secrets.get("admin_password"):
                 st.session_state.admin_logged_in = True
                 st.rerun()
@@ -208,54 +283,69 @@ if not check_store_auth(selected_store):
 # 主畫面邏輯
 # =========================================================
 
-# 這裡改用 if/elif 確保邏輯互斥
-
 if selected_store == "(ALL) 全店總表":
     st.markdown("### 🏆 全公司業績戰情室")
+    st.info("此頁面會連線至各分店的 Google 試算表，讀取當日數據並加總。")
     
     col_date, col_refresh = st.columns([1, 4])
-    # 修正 DuplicateElementId: 加入 key="date_input_all"
-    view_date = col_date.date_input("選擇檢視月份", date.today(), key="date_input_all")
+    view_date = col_date.date_input("選擇檢視日期", date.today(), key="date_input_all")
     
-    # 加入 key="btn_refresh_all"
-    if col_refresh.button("🔄 立即更新全店數據", type="primary", key="btn_refresh_all"):
-        with st.spinner("正在彙整各分店戰報..."):
+    if col_refresh.button("🔄 立即更新全店數據 (真實讀取)", type="primary", key="btn_refresh_all"):
+        with st.spinner("正在彙整各分店戰報 (這可能需要一點時間)..."):
             df_all = aggregate_all_stores_gs(view_date)
             
             st.divider()
             total_profit = df_all["毛利"].sum()
             total_cases = df_all["門號"].sum()
-            avg_score = df_all["綜合指標"].mean()
+            avg_score = df_all[df_all["綜合指標"] > 0]["綜合指標"].mean() # 只算有分數的
+            if pd.isna(avg_score): avg_score = 0
             
             kpi1, kpi2, kpi3, kpi4 = st.columns(4)
-            kpi1.metric("全店總毛利", f"${total_profit:,}", delta="本月累計")
-            kpi2.metric("全店總門號", f"{total_cases} 件")
-            kpi3.metric("全店平均綜合分", f"{avg_score:.1f} 分")
-            kpi4.metric("門市數量", f"{len(df_all)} 間")
+            kpi1.metric("全店總毛利", f"${total_profit:,.0f}", delta="本日即時")
+            kpi2.metric("全店總門號", f"{total_cases:.0f} 件")
+            kpi3.metric("平均綜合分", f"{avg_score:.1f} 分")
+            kpi4.metric("資料來源", f"{len(df_all)} 間門市")
             
             st.subheader("📊 門市績效排行")
             chart1, chart2 = st.columns(2)
             with chart1:
                 st.caption("各店毛利貢獻")
-                df_sorted_profit = df_all.sort_values("毛利", ascending=False)
-                st.bar_chart(df_sorted_profit, x="門市", y="毛利", color="#FF4B4B")
+                # 簡單過濾掉 0 的店
+                df_plot = df_all[df_all["毛利"] > 0]
+                if not df_plot.empty:
+                    st.bar_chart(df_plot, x="門市", y="毛利", color="#FF4B4B")
+                else:
+                    st.info("尚無毛利數據")
+
             with chart2:
                 st.caption("綜合指標分數")
-                st.bar_chart(df_all, x="門市", y="綜合指標", color="#3366CC")
+                df_plot_score = df_all[df_all["綜合指標"] > 0]
+                if not df_plot_score.empty:
+                    st.bar_chart(df_plot_score, x="門市", y="綜合指標", color="#3366CC")
+                else:
+                    st.info("尚無分數數據")
 
             st.subheader("📋 詳細數據列表")
+            
+            # 使用 column_config 替代 style.background_gradient
+            # 這樣就不會出現 matplotlib ImportError
             column_cfg = {
                 "門市": st.column_config.TextColumn("門市名稱", disabled=True),
-                "毛利": st.column_config.NumberColumn("毛利", format="$%d"),
+                "狀態": st.column_config.TextColumn("連線狀態"),
+                "毛利": st.column_config.ProgressColumn(
+                    "毛利貢獻", 
+                    format="$%d", 
+                    min_value=0, 
+                    max_value=int(df_all["毛利"].max()) if not df_all.empty and df_all["毛利"].max() > 0 else 1000
+                ),
                 "門號": st.column_config.NumberColumn("門號", format="%d 件"),
                 "保險營收": st.column_config.NumberColumn("保險", format="$%d"),
                 "配件營收": st.column_config.NumberColumn("配件", format="$%d"),
-                "遠傳升續率": st.column_config.ProgressColumn("升續率", format="%.1f%%", min_value=0, max_value=1),
-                "遠傳平續率": st.column_config.ProgressColumn("平續率", format="%.1f%%", min_value=0, max_value=1),
                 "綜合指標": st.column_config.NumberColumn("綜合分數", format="%.1f 分"),
             }
+            
             st.dataframe(
-                df_all.style.background_gradient(subset=["毛利", "綜合指標"], cmap="Reds"),
+                df_all,
                 column_config=column_cfg,
                 use_container_width=True,
                 hide_index=True
@@ -265,10 +355,8 @@ elif selected_user == "該店總表":
     st.markdown("### 📥 門市報表檢視中心 (Google Sheets)")
     
     col_d1, col_d2 = st.columns([1, 2])
-    # 修正 DuplicateElementId: 加入 key="date_input_store"
     view_date = col_d1.date_input("選擇報表月份", date.today(), key="date_input_store")
 
-    # 加入 key="btn_load_sheet"
     if col_d1.button("📂 讀取雲端報表", use_container_width=True, key="btn_load_sheet"):
         with st.spinner("連線 Google Sheets..."):
             sh_obj, file_msg, file_link = read_google_sheet_data(selected_store, view_date)
@@ -291,7 +379,6 @@ elif selected_user == "該店總表":
         if file_data.get('link'):
             c_btn1.link_button("🔗 前往 Google 試算表編輯", file_data['link'], type="primary", use_container_width=True)
         
-        # 加入 key="btn_refresh_sheet"
         if c_btn3.button("🔄 重新整理", use_container_width=True, key="btn_refresh_sheet"):
             st.session_state.current_excel_file = None
             st.rerun()
@@ -303,7 +390,6 @@ elif selected_user == "該店總表":
             worksheets = sh.worksheets()
             sheet_names = [ws.title for ws in worksheets]
             col_sheet, _ = st.columns([1, 2])
-            # 加入 key="select_sheet_preview"
             selected_sheet_name = col_sheet.selectbox("選擇要檢視的分頁", sheet_names, key="select_sheet_preview")
             
             ws = sh.worksheet(selected_sheet_name)
@@ -321,7 +407,6 @@ else:
 
     with st.form("daily_input_full"):
         d_col1, d_col2 = st.columns([1, 3])
-        # Form 裡面的 key 不需要太擔心重複，因為 Form 本身是隔離的，但習慣上還是小心
         input_date = d_col1.date_input("📅 報表日期", date.today())
         st.markdown("---")
 
@@ -375,7 +460,6 @@ else:
         st.dataframe(df_p.drop(columns=['日期']), hide_index=True)
         
         col_ok, col_no = st.columns([1, 1])
-        # 加入 key
         if col_ok.button("✅ 確認上傳至 Google Sheets (Step 2)", type="primary", use_container_width=True, key="btn_confirm_upload"):
             progress_text = "寫入試算表中..."
             my_bar = st.progress(0, text=progress_text)
@@ -394,7 +478,6 @@ else:
                 else: st.error(msg)
             except Exception as e: st.error(f"錯誤: {e}")
         
-        # 加入 key
         if col_no.button("❌ 取消", key="btn_cancel_upload"):
             st.session_state.preview_data = None
             st.rerun()
