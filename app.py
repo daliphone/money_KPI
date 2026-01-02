@@ -1,7 +1,5 @@
 import streamlit as st
 import pandas as pd
-import openpyxl
-from io import BytesIO
 from datetime import date, datetime
 import time
 
@@ -12,175 +10,187 @@ st.set_page_config(page_title="全店業績戰情室", layout="wide", page_icon=
 if 'preview_data' not in st.session_state: st.session_state.preview_data = None
 if 'preview_score' not in st.session_state: st.session_state.preview_score = 0
 if 'authenticated_store' not in st.session_state: st.session_state.authenticated_store = None
-if 'current_excel_file' not in st.session_state: st.session_state.current_excel_file = None
 if 'admin_logged_in' not in st.session_state: st.session_state.admin_logged_in = False
 
-# 檢查必要設定
+# 檢查 Secrets
 if "gcp_service_account" not in st.secrets:
     st.error("❌ 嚴重錯誤：Secrets 中找不到 [gcp_service_account]。")
     st.stop()
 if "TARGET_FOLDER_ID" not in st.secrets:
     st.warning("⚠️ 警告：Secrets 中找不到 TARGET_FOLDER_ID。")
 
-# Google 套件
+# 匯入 Google 套件
 try:
-    from google.oauth2 import service_account
-    from googleapiclient.discovery import build
-    from googleapiclient.http import MediaIoBaseUpload
+    import gspread
+    from google.oauth2.service_account import Credentials
+    from googleapiclient.discovery import build # 仍需用於搜尋檔案 ID
 except ImportError:
-    st.error("❌ 缺少 Google 套件，請檢查 requirements.txt")
+    st.error("❌ 缺少套件，請在 requirements.txt 加入 `gspread`")
     st.stop()
 
-# --- 2. Google Drive 功能 (核心) ---
-def get_drive_service():
-    creds_dict = dict(st.secrets["gcp_service_account"])
-    creds = service_account.Credentials.from_service_account_info(
-        creds_dict, scopes=['https://www.googleapis.com/auth/drive']
-    )
-    return build('drive', 'v3', credentials=creds)
+# --- 2. Google Sheets 連線功能 (核心) ---
 
-def get_file_id_in_folder(service, filename, folder_id):
-    """全域搜尋檔案"""
-    query = f"name = '{filename}' and trashed = false"
-    # 增加 parents 查詢以確保在正確資料夾
+def get_gspread_client():
+    """建立 gspread 客戶端與 Drive API 服務"""
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive"
+    ]
+    creds_dict = dict(st.secrets["gcp_service_account"])
+    creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+    client = gspread.authorize(creds)
+    
+    # 另外建立 Drive Service 用於搜尋資料夾內的檔案 ID
+    drive_service = build('drive', 'v3', credentials=creds)
+    
+    return client, drive_service
+
+def get_sheet_id_by_name(drive_service, filename, folder_id):
+    """
+    在指定資料夾搜尋 Google Sheets 檔案 ID
+    注意：Google Sheets 在 Drive API 中沒有副檔名，MimeType 為 application/vnd.google-apps.spreadsheet
+    """
+    query = f"name = '{filename}' and trashed = false and mimeType = 'application/vnd.google-apps.spreadsheet'"
     if folder_id:
         query += f" and '{folder_id}' in parents"
         
-    results = service.files().list(q=query, fields="files(id, name)", orderBy="createdTime desc").execute()
+    results = drive_service.files().list(q=query, fields="files(id, name, webViewLink)").execute()
     items = results.get('files', [])
-    if not items: return None
-    return items[0]['id']
-
-def update_excel_drive(store, staff, date_obj, data_dict):
-    """寫入資料到雲端 Excel"""
-    folder_id = st.secrets.get("TARGET_FOLDER_ID")
-    filename = f"{date_obj.year}_{date_obj.month:02d}_{store}業績日報表.xlsx"
     
-    try:
-        service = get_drive_service()
-        file_id = get_file_id_in_folder(service, filename, folder_id)
-        if not file_id:
-            return f"❌ 找不到檔案 [{filename}]，請確認雲端硬碟檔名。"
+    if not items: return None, None
+    return items[0]['id'], items[0]['webViewLink']
 
-        request = service.files().get_media(fileId=file_id)
-        file_content = request.execute()
-        excel_stream = BytesIO(file_content)
+def update_google_sheet(store, staff, date_obj, data_dict):
+    """直接更新 Google 試算表儲存格"""
+    folder_id = st.secrets.get("TARGET_FOLDER_ID")
+    # Google Sheet 檔名通常不帶 .xlsx，這裡假設您的檔名格式為 "2026_01_東門店業績日報表"
+    filename = f"{date_obj.year}_{date_obj.month:02d}_{store}業績日報表"
+
+    try:
+        client, drive_service = get_gspread_client()
         
-        wb = openpyxl.load_workbook(excel_stream)
-        if staff not in wb.sheetnames:
+        # 1. 找到檔案 ID
+        file_id, file_url = get_sheet_id_by_name(drive_service, filename, folder_id)
+        if not file_id:
+            return f"❌ 找不到試算表：[{filename}]。請確認已將 Excel 轉存為 Google 試算表格式，且位於正確資料夾。"
+
+        # 2. 開啟試算表與分頁
+        sh = client.open_by_key(file_id)
+        
+        try:
+            ws = sh.worksheet(staff)
+        except gspread.WorksheetNotFound:
             return f"❌ 找不到人員分頁：[{staff}]"
-        
-        ws = wb[staff]
-        # 假設第 15 列是 1 號，則當日列數為 15 + (日期 - 1)
+
+        # 3. 計算寫入列數 (邏輯：第 15 列為 1 號)
         target_row = 15 + (date_obj.day - 1)
         
-        # 定義欄位對應 (依據 Excel 實際欄位順序調整)
+        # 4. 定義欄位對應 (Col A=1, B=2...)
         col_map = {
-            '毛利': 2, 
-            '門號': 3, 
-            '保險營收': 4, 
-            '配件營收': 5,
-            '庫存手機': 6, 
-            '蘋果手機': 7, 
-            '蘋果平板+手錶': 8, 
-            'VIVO手機': 9,
-            '生活圈': 10, 
-            'GOOGLE 評論': 11, 
-            '來客數': 12,
-            '遠傳續約': 13,        # 新增
-            '遠傳續約累積GAP': 14, # 順延
-            '遠傳升續率': 15,      # 順延
-            '遠傳平續率': 16,      # 順延
-            '綜合指標': 17         # 新增
+            '毛利': 2, '門號': 3, '保險營收': 4, '配件營收': 5,
+            '庫存手機': 6, '蘋果手機': 7, '蘋果平板+手錶': 8, 'VIVO手機': 9,
+            '生活圈': 10, 'GOOGLE 評論': 11, '來客數': 12,
+            '遠傳續約': 13,
+            '遠傳續約累積GAP': 14, 
+            '遠傳升續率': 15, 
+            '遠傳平續率': 16,
+            '綜合指標': 17
         }
         
-        # 這些欄位是直接覆蓋數值 (不是累加)
+        # 覆蓋模式的欄位
         overwrite_fields = ['遠傳續約累積GAP', '遠傳升續率', '遠傳平續率', '綜合指標']
         
+        # 5. 批次讀取舊資料以進行累加 (減少 API 呼叫次數)
+        # 讀取該列目前的數值 (假設資料在 B 到 Q 欄 -> Col 2 to 17)
+        # current_values = ws.row_values(target_row) # 這會讀整列，稍微處理一下
+        
+        # 為了精準更新，我們逐一 cell 更新 (gspread 的 batch_update 比較快，但逐格寫比較好懂)
+        # 若要追求效能，可改用 batch_update。這裡為了穩定性，先逐格檢查。
+        
+        updates = []
         for field, new_val in data_dict.items():
             if field in col_map and new_val is not None:
                 col_idx = col_map[field]
-                cell = ws.cell(row=target_row, column=col_idx)
                 
-                # 讀取舊值 (若非數值則設為 0)
-                old_val = cell.value if isinstance(cell.value, (int, float)) else 0
-                
+                # 如果是覆蓋模式，直接加到更新清單
                 if field in overwrite_fields:
-                    cell.value = new_val
+                    updates.append({
+                        'range': gspread.utils.rowcol_to_a1(target_row, col_idx),
+                        'values': [[new_val]]
+                    })
                 else:
-                    # 其他欄位採累加模式 (可依需求改為覆蓋)
-                    cell.value = old_val + new_val
+                    # 累加模式：先讀取舊值 (注意：這會增加 API 時間，若太慢可優化)
+                    old_val = ws.cell(target_row, col_idx).value
+                    # 處理舊值：可能是字串、None 或數字
+                    try:
+                        if old_val in [None, "", " "]: 
+                            old_num = 0
+                        else:
+                            # 移除可能的逗號或貨幣符號
+                            old_num = float(str(old_val).replace(",", "").replace("$", ""))
+                    except ValueError:
+                        old_num = 0
+                        
+                    final_val = old_num + new_val
+                    updates.append({
+                        'range': gspread.utils.rowcol_to_a1(target_row, col_idx),
+                        'values': [[final_val]]
+                    })
 
-        output_stream = BytesIO()
-        wb.save(output_stream)
-        output_stream.seek(0)
-        
-        media = MediaIoBaseUpload(output_stream, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
-        service.files().update(fileId=file_id, media_body=media).execute()
-        
+        # 執行批次更新
+        if updates:
+            ws.batch_update(updates)
+
         return f"✅ 資料已成功寫入：{filename}"
 
     except Exception as e:
-        return f"❌ 系統錯誤: {str(e)}"
+        return f"❌ 寫入失敗: {str(e)}"
 
-def read_excel_drive(store, date_obj):
-    """回傳：(檔案內容Bytes, 檔名, 線上連結URL)"""
+def read_google_sheet_data(store, date_obj):
+    """讀取 Google 試算表資料用於預覽"""
     folder_id = st.secrets.get("TARGET_FOLDER_ID")
-    filename = f"{date_obj.year}_{date_obj.month:02d}_{store}業績日報表.xlsx"
+    filename = f"{date_obj.year}_{date_obj.month:02d}_{store}業績日報表"
     
     try:
-        service = get_drive_service()
-        file_id = get_file_id_in_folder(service, filename, folder_id)
+        client, drive_service = get_gspread_client()
+        file_id, file_url = get_sheet_id_by_name(drive_service, filename, folder_id)
         
         if not file_id:
-            return None, f"找不到檔案：{filename}", None
+            return None, f"找不到試算表：{filename}", None
 
-        # 1. 取得檔案的線上連結 (webViewLink)
-        file_meta = service.files().get(fileId=file_id, fields='webViewLink').execute()
-        file_url = file_meta.get('webViewLink')
-
-        # 2. 下載檔案內容
-        request = service.files().get_media(fileId=file_id)
-        file_content = request.execute()
+        sh = client.open_by_key(file_id)
         
-        return file_content, filename, file_url
+        # 回傳：(Sheet物件, 檔名, 連結)
+        return sh, filename, file_url
 
     except Exception as e:
         return None, str(e), None
 
-def aggregate_all_stores(date_obj):
-    """(新增功能) 彙整所有分店當月數據"""
+def aggregate_all_stores_gs(date_obj):
+    """(Google Sheets 版) 彙整所有分店當月數據"""
     folder_id = st.secrets.get("TARGET_FOLDER_ID")
-    service = get_drive_service()
+    client, drive_service = get_gspread_client()
     
     all_data = []
     
-    # 遍歷所有分店
     for store_name in STORES.keys():
         if store_name == "(ALL) 全店總表": continue
         
-        filename = f"{date_obj.year}_{date_obj.month:02d}_{store_name}業績日報表.xlsx"
-        file_id = get_file_id_in_folder(service, filename, folder_id)
+        filename = f"{date_obj.year}_{date_obj.month:02d}_{store_name}業績日報表"
+        file_id, file_url = get_sheet_id_by_name(drive_service, filename, folder_id)
         
         store_stats = {
             "門市": store_name,
-            "毛利": 0, "門號": 0, "保險營收": 0, "配件營收": 0,
-            "來客數": 0, "遠傳續約": 0, "綜合指標": 0,
-            "連結": None
+            "狀態": "❌ 未建立",
+            "連結": file_url
         }
 
         if file_id:
-            # 取得連結
-            meta = service.files().get(fileId=file_id, fields='webViewLink').execute()
-            store_stats["連結"] = meta.get('webViewLink')
-            
-            # 讀取內容進行簡單加總 (這裡只示範讀取 '總表' 分頁的最後一列，或是累加所有人員)
-            # 為了效能，這裡暫時只讀取檔案存在與否，若要深入讀取數值需下載每個 Excel
-            # 這裡示範：標記為「已讀取」
             store_stats["狀態"] = "✅ 線上"
-        else:
-            store_stats["狀態"] = "❌ 未建立"
-            
+            # 若要進階：打開 Sheet 讀取 "總表" 分頁的加總值
+            # sh = client.open_by_key(file_id)
+            # ws = sh.worksheet("總表") ...
+        
         all_data.append(store_stats)
         
     return pd.DataFrame(all_data)
@@ -198,7 +208,6 @@ STORES = {
     "五甲店": ["阿凱", "孟婧", "支援", "人員2"],
     "鳳山店": ["店長", "組員"]
 }
-# 預設目標 (可依需求調整)
 DEFAULT_TARGETS = {'毛利': 140000, '門號': 24, '保險': 28000, '配件': 35000, '庫存': 21}
 
 # --- 4. 介面與權限邏輯 ---
@@ -217,7 +226,6 @@ st.title(f"📊 {selected_store} - {selected_user}")
 
 # 權限驗證函式
 def check_store_auth(current_store):
-    # 全店總表 -> 管理員密碼
     if current_store == "(ALL) 全店總表":
         if st.session_state.admin_logged_in: return True
         st.info("🛡️ 此區域需要管理員權限")
@@ -226,11 +234,9 @@ def check_store_auth(current_store):
             if admin_input == st.secrets.get("admin_password"):
                 st.session_state.admin_logged_in = True
                 st.rerun()
-            else:
-                st.error("❌ 密碼錯誤")
+            else: st.error("❌ 密碼錯誤")
         return False
 
-    # 各分店 -> 分店密碼
     if st.session_state.authenticated_store == current_store: return True
 
     st.info(f"🔒 請輸入【{current_store}】的專屬密碼")
@@ -238,7 +244,6 @@ def check_store_auth(current_store):
         input_pass = st.text_input("密碼", type="password")
         login_btn = st.form_submit_button("登入")
         if login_btn:
-            # 從 secrets["store_passwords"] 取得密碼
             correct_pass = st.secrets["store_passwords"].get(current_store)
             if not correct_pass: st.error("⚠️ 未設定密碼")
             elif input_pass == correct_pass:
@@ -257,93 +262,77 @@ if not check_store_auth(selected_store):
 
 if selected_store == "(ALL) 全店總表":
     st.success("✅ 管理員權限已解鎖")
-    st.markdown("### 🏆 全公司業績戰情室")
+    st.markdown("### 🏆 全公司業績戰情室 (Google Sheets 版)")
     
     col_date, _ = st.columns([1, 3])
     view_date = col_date.date_input("選擇檢視月份", date.today())
     
-    if st.button("🔄 讀取全部分店數據"):
-        with st.spinner("正在連線各分店報表..."):
-            df_all_stores = aggregate_all_stores(view_date)
+    if st.button("🔄 讀取全部分店狀態"):
+        with st.spinner("正在搜尋雲端試算表..."):
+            df_all_stores = aggregate_all_stores_gs(view_date)
             st.dataframe(
                 df_all_stores, 
                 column_config={
-                    "連結": st.column_config.LinkColumn("雲端檔案")
+                    "連結": st.column_config.LinkColumn("雲端試算表")
                 },
                 use_container_width=True
             )
-            st.caption("💡 提示：點擊連結可直接開啟各店原始 Excel 檔")
 
 elif selected_user == "該店總表":
-    # ----------------------------------------------------
-    # 門市報表檢視中心 (含線上連結)
-    # ----------------------------------------------------
-    st.markdown("### 📥 門市報表檢視中心")
-    st.info("在此您可以下載、線上預覽，或直接開啟 Google 試算表。")
-
+    st.markdown("### 📥 門市報表檢視中心 (Google Sheets)")
+    
     col_d1, col_d2 = st.columns([1, 2])
     view_date = col_d1.date_input("選擇報表月份", date.today())
-    
+
     if col_d1.button("📂 讀取雲端報表", use_container_width=True):
-        with st.spinner("正在從 Google Drive 讀取資料..."):
-            file_bytes, file_msg, file_link = read_excel_drive(selected_store, view_date)
+        with st.spinner("連線 Google Sheets..."):
+            sh_obj, file_msg, file_link = read_google_sheet_data(selected_store, view_date)
             
-            if file_bytes:
+            if sh_obj:
                 st.session_state.current_excel_file = {
-                    'bytes': file_bytes,
+                    'sheet_obj': sh_obj, # 存入 Sheet 物件
                     'name': file_msg,
                     'link': file_link
                 }
-                st.success("✅ 報表讀取成功！")
+                st.success("✅ 試算表連線成功！")
             else:
-                st.error(f"❌ {file_msg}")
+                st.error(file_msg)
     
-    # 顯示操作區
     if st.session_state.current_excel_file:
         file_data = st.session_state.current_excel_file
         st.divider()
-        st.subheader(f"📄 檔案：{file_data['name']}")
+        st.subheader(f"📄 試算表：{file_data['name']}")
         
-        # 三大按鈕
-        c_btn1, c_btn2, c_btn3 = st.columns(3)
-        
-        # 1. Google Drive 開啟連結
+        c_btn1, c_btn3 = st.columns([1, 1])
         if file_data.get('link'):
-            c_btn1.link_button(
-                "🔗 在 Google Drive 開啟", 
-                file_data['link'], 
-                type="primary", 
-                use_container_width=True
-            )
+            c_btn1.link_button("🔗 前往 Google 試算表編輯", file_data['link'], type="primary", use_container_width=True)
         
-        # 2. 下載按鈕
-        c_btn2.download_button(
-            label="💾 下載 Excel 檔",
-            data=file_data['bytes'],
-            file_name=file_data['name'],
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True
-        )
-        
-        # 3. 重整
-        if c_btn3.button("🔄 重新整理數據", use_container_width=True):
+        if c_btn3.button("🔄 重新整理", use_container_width=True):
             st.session_state.current_excel_file = None
             st.rerun()
 
         st.markdown("---")
-        st.write("#### 👀 網頁內快速預覽 (唯讀)")
+        st.write("#### 👀 網頁內快速預覽")
         
         try:
-            excel_obj = pd.ExcelFile(BytesIO(file_data['bytes']))
-            sheet_names = excel_obj.sheet_names
-            col_sheet, _ = st.columns([1, 2])
-            selected_sheet = col_sheet.selectbox("選擇要檢視的分頁", sheet_names)
+            # 從 Sheet 物件讀取分頁
+            sh = file_data['sheet_obj']
+            # 取得所有分頁名稱
+            # 注意：gspread 每次呼叫都是 API request，若分頁多會慢
+            worksheets = sh.worksheets()
+            sheet_names = [ws.title for ws in worksheets]
             
-            df_preview = pd.read_excel(excel_obj, sheet_name=selected_sheet)
+            col_sheet, _ = st.columns([1, 2])
+            selected_sheet_name = col_sheet.selectbox("選擇要檢視的分頁", sheet_names)
+            
+            # 讀取數據
+            ws = sh.worksheet(selected_sheet_name)
+            data = ws.get_all_values()
+            df_preview = pd.DataFrame(data)
             st.dataframe(df_preview, use_container_width=True)
             
         except Exception as e:
-            st.warning("預覽載入失敗，請直接開啟檔案查看。")
+            st.warning(f"預覽載入失敗 (可能是連線逾時): {str(e)}")
 
 else:
     # ----------------------------------------------------
@@ -357,7 +346,7 @@ else:
         st.markdown("---")
 
         # 1. 財務與門號
-        st.subheader("💰 財務與門號 (Core)")
+        st.subheader("💰 財務與門號")
         c1, c2, c3, c4 = st.columns(4)
         in_profit = c1.number_input("毛利 ($)", min_value=0, step=100)
         in_number = c2.number_input("門號 (件)", min_value=0, step=1)
@@ -365,7 +354,7 @@ else:
         in_acc = c4.number_input("配件營收 ($)", min_value=0, step=100)
 
         # 2. 硬體銷售
-        st.subheader("📱 硬體銷售 (Hardware)")
+        st.subheader("📱 硬體銷售")
         h1, h2, h3, h4 = st.columns(4)
         in_stock = h1.number_input("庫存手機 (台)", min_value=0, step=1)
         in_vivo = h2.number_input("VIVO 手機 (台)", min_value=0, step=1)
@@ -373,37 +362,29 @@ else:
         in_ipad = h4.number_input("🍎 平板/手錶 (台)", min_value=0, step=1)
 
         # 3. 顧客經營
-        st.subheader("🤝 顧客經營 (Service)")
+        st.subheader("🤝 顧客經營")
         s1, s2, s3 = st.columns(3)
         in_life = s1.number_input("生活圈 (件)", min_value=0, step=1)
         in_review = s2.number_input("Google 評論 (則)", min_value=0, step=1)
         in_traffic = s3.number_input("來客數 (人)", min_value=0, step=1)
 
-        # 4. 遠傳專案指標
-        st.subheader("📡 遠傳專案指標 (KPI)")
+        # 4. 遠傳專案
+        st.subheader("📡 遠傳專案指標")
         t1, t2, t3, t4 = st.columns(4)
         in_renew = t1.number_input("遠傳續約 (件)", min_value=0, step=1)
         in_gap = t2.number_input("遠傳續約累積 GAP", step=1)
         in_up_rate_raw = t3.number_input("遠傳升續率 (%)", min_value=0.0, max_value=100.0, step=0.1)
         in_flat_rate_raw = t4.number_input("遠傳平續率 (%)", min_value=0.0, max_value=100.0, step=0.1)
         
-        # 5. 綜合指標
+        # 5. 綜合
         st.subheader("🏆 綜合評估")
         in_composite = st.number_input("綜合指標分數", min_value=0.0, step=0.1)
         
-        check_btn = st.form_submit_button("🔍 試算分數並預覽 (Step 1)", use_container_width=True)
+        check_btn = st.form_submit_button("🔍 預覽 (Step 1)", use_container_width=True)
 
         if check_btn:
-            # 簡易試算邏輯 (可自訂)
-            def calc(act, tgt, w): return (act / tgt * w) if tgt > 0 else 0
-            score = (
-                calc(in_profit, DEFAULT_TARGETS['毛利'], 0.25) + 
-                calc(in_number, DEFAULT_TARGETS['門號'], 0.20) + 
-                calc(in_insur, DEFAULT_TARGETS['保險'], 0.15) + 
-                calc(in_acc, DEFAULT_TARGETS['配件'], 0.15) + 
-                calc(in_stock, DEFAULT_TARGETS['庫存'], 0.15)
-            )
-            
+            # 試算預覽
+            score = 0 # 暫時簡化
             st.session_state.preview_data = {
                 '毛利': in_profit, '門號': in_number, '保險營收': in_insur, '配件營收': in_acc,
                 '庫存手機': in_stock, '蘋果手機': in_apple, '蘋果平板+手錶': in_ipad, 'VIVO手機': in_vivo,
@@ -415,55 +396,38 @@ else:
                 '綜合指標': in_composite,
                 '日期': input_date
             }
-            st.session_state.preview_score = score
             st.rerun()
 
     if st.session_state.preview_data:
         st.divider()
-        st.markdown("### 👀 請確認下方資料是否正確？")
+        st.markdown("### 👀 確認資料")
+        df_p = pd.DataFrame([st.session_state.preview_data])
+        st.dataframe(df_p.drop(columns=['日期']), hide_index=True)
         
-        # 顯示預覽表格，並格式化百分比
-        df_preview = pd.DataFrame([st.session_state.preview_data])
-        # 隱藏日期欄位以免混淆
-        display_df = df_preview.drop(columns=['日期'])
-        
-        st.dataframe(
-            display_df, 
-            hide_index=True,
-            column_config={
-                "遠傳升續率": st.column_config.NumberColumn(format="%.1f%%"),
-                "遠傳平續率": st.column_config.NumberColumn(format="%.1f%%"),
-                "毛利": st.column_config.NumberColumn(format="$%d"),
-            }
-        )
-        
-        if st.session_state.preview_score > 0:
-            st.info(f"💡 系統試算核心貢獻度：{st.session_state.preview_score*100:.1f} 分 (僅供參考)")
-        
-        col_confirm, col_cancel = st.columns([1, 1])
-        if col_confirm.button("✅ 確認無誤，立即上傳 (Step 2)", type="primary", use_container_width=True):
-            progress_text = "連線 Google Drive 中...請稍候"
+        col_ok, col_no = st.columns([1, 1])
+        if col_ok.button("✅ 確認上傳至 Google Sheets (Step 2)", type="primary", use_container_width=True):
+            progress_text = "寫入試算表中..."
             my_bar = st.progress(0, text=progress_text)
+            
             try:
-                data_to_save = st.session_state.preview_data.copy()
-                target_date = data_to_save.pop('日期')
-                my_bar.progress(30, text="正在搜尋雲端檔案...")
+                data_copy = st.session_state.preview_data.copy()
+                t_date = data_copy.pop('日期')
+                my_bar.progress(50, text="連線 API...")
                 
-                result_msg = update_excel_drive(selected_store, selected_user, target_date, data_to_save)
-                my_bar.progress(100, text="處理完成！")
+                msg = update_google_sheet(selected_store, selected_user, t_date, data_copy)
+                my_bar.progress(100)
                 
-                if "✅" in result_msg:
-                    st.success(result_msg)
+                if "✅" in msg:
+                    st.success(msg)
                     st.balloons()
                     st.session_state.preview_data = None
-                    st.session_state.preview_score = 0
-                    time.sleep(3)
+                    time.sleep(2)
                     st.rerun()
                 else:
-                    st.error(result_msg)
+                    st.error(msg)
             except Exception as e:
-                st.error(f"❌ 錯誤: {str(e)}")
+                st.error(f"錯誤: {e}")
         
-        if col_cancel.button("❌ 有錯誤，重新填寫", use_container_width=True):
+        if col_no.button("❌ 取消"):
             st.session_state.preview_data = None
             st.rerun()
