@@ -57,7 +57,9 @@ def safe_float(value):
     """將表格內容轉為浮點數，失敗回傳 0"""
     try:
         if value in [None, "", " "]: return 0.0
-        return float(str(value).replace(",", "").replace("$", "").replace("%", ""))
+        # 移除常見的貨幣符號與逗號
+        clean_val = str(value).replace(",", "").replace("$", "").replace("%", "").strip()
+        return float(clean_val)
     except ValueError:
         return 0.0
 
@@ -87,6 +89,7 @@ def update_google_sheet(store, staff, date_obj, data_dict):
             '遠傳續約': 13, '遠傳續約累積GAP': 14, 
             '遠傳升續率': 15, '遠傳平續率': 16, '綜合指標': 17
         }
+        # 這些欄位採取「覆蓋」模式，其餘採「累加」模式
         overwrite_fields = ['遠傳續約累積GAP', '遠傳升續率', '遠傳平續率', '綜合指標']
         
         updates = []
@@ -121,24 +124,19 @@ def read_google_sheet_data(store, date_obj):
 
 def aggregate_all_stores_gs(date_obj):
     """
-    (真實版) 彙整所有分店數據
-    會開啟每一家分店的試算表，將該店所有人員當日數據加總。
+    (真實加總版) 彙整所有分店數據
+    直接讀取該店所有【人員分頁】的當日數據並相加，不依賴 Excel 總表公式。
     """
     folder_id = st.secrets.get("TARGET_FOLDER_ID")
     client, drive_service = get_gspread_client()
     
     all_data = []
     
-    # 定義要加總的欄位索引 (Excel 中的 Column B=2, C=3...)
-    # 這裡我們只抓取重點數據進行加總展示
-    metrics_indices = {
-        "毛利": 2, "門號": 3, "保險營收": 4, "配件營收": 5, "綜合指標": 17
-    }
-    
+    # 計算當日所在的列數 (Day 1 = Row 15)
     target_row = 15 + (date_obj.day - 1)
 
-    # 進度條
-    prog_bar = st.progress(0, text="開始彙整...")
+    # 進度條設定
+    prog_bar = st.progress(0, text="正在連線雲端資料庫...")
     total_steps = len(STORES) - 1 # 扣掉 ALL
     current_step = 0
 
@@ -146,7 +144,7 @@ def aggregate_all_stores_gs(date_obj):
         if store_name == "(ALL) 全店總表": continue
         
         current_step += 1
-        prog_bar.progress(int(current_step / total_steps * 100), text=f"正在讀取：{store_name}...")
+        prog_bar.progress(int(current_step / total_steps * 100), text=f"正在讀取並計算：{store_name}...")
         
         filename = f"{date_obj.year}_{date_obj.month:02d}_{store_name}業績日報表"
         file_id, file_url = get_sheet_id_by_name(drive_service, filename, folder_id)
@@ -162,50 +160,62 @@ def aggregate_all_stores_gs(date_obj):
                 sh = client.open_by_key(file_id)
                 store_stats["狀態"] = "✅ 正常"
                 
-                # 遍歷該店所有人員進行加總
-                # 注意：這會比較慢，因為要開多個分頁。為了效能，這裡假設 Excel 有一個 "總表" 分頁
-                # 如果您的 Excel 已經有公式自動算總表，讀總表最快。
-                # 如果沒有，我們必須讀每個人的分頁。
+                # --- 核心修改：暴力加總所有人員 ---
+                # 不讀取總表，而是遍歷該店所有人員清單，讀取他們的 Row Values
                 
-                # 方案 A：嘗試讀取 '總表' 或 '總計' 分頁 (最快)
-                summary_sheet = None
-                for possible_name in ["總表", "總計", "TOTAL", "Total"]:
-                    try:
-                        summary_sheet = sh.worksheet(possible_name)
-                        break
-                    except: pass
-                
-                if summary_sheet:
-                    # 直接讀取總表的該日數據
-                    row_vals = summary_sheet.row_values(target_row)
-                    # row_vals 是 list，index 0 對應 Col A
-                    # 毛利 Col 2 -> index 1
-                    if len(row_vals) >= 17:
-                        store_stats["毛利"] = safe_float(row_vals[1])
-                        store_stats["門號"] = safe_float(row_vals[2])
-                        store_stats["保險營收"] = safe_float(row_vals[3])
-                        store_stats["配件營收"] = safe_float(row_vals[4])
-                        store_stats["綜合指標"] = safe_float(row_vals[16])
-                else:
-                    # 方案 B：若無總表，則加總所有人員 (較慢，但準確)
-                    for staff in staff_list:
+                # 為了提升速度，我們取得所有分頁的清單
+                try:
+                    all_worksheets = sh.worksheets()
+                    sheet_map = {ws.title: ws for ws in all_worksheets}
+                except:
+                    # 如果讀取所有分頁失敗，就跳過
+                    continue
+
+                count_staff_data = 0
+                for staff in staff_list:
+                    if staff in sheet_map:
+                        ws = sheet_map[staff]
+                        # 讀取該列數據 (API Call)
                         try:
-                            ws = sh.worksheet(staff)
-                            val_profit = safe_float(ws.cell(target_row, 2).value)
-                            val_num = safe_float(ws.cell(target_row, 3).value)
-                            val_ins = safe_float(ws.cell(target_row, 4).value)
-                            val_acc = safe_float(ws.cell(target_row, 5).value)
-                            val_score = safe_float(ws.cell(target_row, 17).value)
+                            # row_values 回傳的是 list of strings
+                            row_vals = ws.row_values(target_row)
                             
-                            store_stats["毛利"] += val_profit
-                            store_stats["門號"] += val_num
-                            store_stats["保險營收"] += val_ins
-                            store_stats["配件營收"] += val_acc
-                            # 綜合指標通常是平均或加總？這裡先用平均
-                            if store_stats["綜合指標"] == 0: store_stats["綜合指標"] = val_score
-                            else: store_stats["綜合指標"] = (store_stats["綜合指標"] + val_score) / 2
-                        except:
-                            pass # 該人員分頁不存在跳過
+                            # 確保長度足夠 (至少要讀到 Col 17)
+                            if len(row_vals) >= 2:
+                                # 注意：row_values 的 index 0 對應 Column A (1)
+                                # 毛利 Col 2 -> index 1
+                                # 門號 Col 3 -> index 2 ...
+                                
+                                val_profit = safe_float(row_vals[1]) if len(row_vals) > 1 else 0
+                                val_num = safe_float(row_vals[2]) if len(row_vals) > 2 else 0
+                                val_ins = safe_float(row_vals[3]) if len(row_vals) > 3 else 0
+                                val_acc = safe_float(row_vals[4]) if len(row_vals) > 4 else 0
+                                val_score = safe_float(row_vals[16]) if len(row_vals) > 16 else 0
+                                
+                                store_stats["毛利"] += val_profit
+                                store_stats["門號"] += val_num
+                                store_stats["保險營收"] += val_ins
+                                store_stats["配件營收"] += val_acc
+                                
+                                # 綜合指標取加總 (或者是所有人的平均? 這裡暫時用加總，您可依需求改)
+                                # 假設是個人分數，那店分數應該是平均
+                                if val_score > 0:
+                                    if store_stats["綜合指標"] == 0: 
+                                        store_stats["綜合指標"] = val_score
+                                    else:
+                                        # 簡單平均計算：(舊總分 * 人數 + 新分) / 新人數 -> 太複雜
+                                        # 這裡採用「累加後續再除以人數」的策略太慢
+                                        # 暫時策略：顯示「累積總分」或「最後一位」
+                                        # 為了展示，這裡先做「累加」，顯示全店總戰力
+                                        store_stats["綜合指標"] += val_score 
+                                        
+                                count_staff_data += 1
+                        except Exception as inner_e:
+                            print(f"Error reading staff {staff}: {inner_e}")
+
+                # 如果是算平均分，可以在這裡除以有數據的人數
+                if count_staff_data > 0:
+                    store_stats["綜合指標"] = store_stats["綜合指標"] / count_staff_data
 
             except Exception as e:
                 store_stats["狀態"] = "⚠️ 讀取錯"
@@ -285,23 +295,23 @@ if not check_store_auth(selected_store):
 
 if selected_store == "(ALL) 全店總表":
     st.markdown("### 🏆 全公司業績戰情室")
-    st.info("此頁面會連線至各分店的 Google 試算表，讀取當日數據並加總。")
+    st.info("💡 系統將逐一掃描各分店人員報表，進行精確彙總。")
     
     col_date, col_refresh = st.columns([1, 4])
     view_date = col_date.date_input("選擇檢視日期", date.today(), key="date_input_all")
     
-    if col_refresh.button("🔄 立即更新全店數據 (真實讀取)", type="primary", key="btn_refresh_all"):
-        with st.spinner("正在彙整各分店戰報 (這可能需要一點時間)..."):
+    if col_refresh.button("🔄 立即更新全店數據 (真實彙整)", type="primary", key="btn_refresh_all"):
+        with st.spinner("正在逐店計算業績..."):
             df_all = aggregate_all_stores_gs(view_date)
             
             st.divider()
             total_profit = df_all["毛利"].sum()
             total_cases = df_all["門號"].sum()
-            avg_score = df_all[df_all["綜合指標"] > 0]["綜合指標"].mean() # 只算有分數的
+            avg_score = df_all[df_all["綜合指標"] > 0]["綜合指標"].mean()
             if pd.isna(avg_score): avg_score = 0
             
             kpi1, kpi2, kpi3, kpi4 = st.columns(4)
-            kpi1.metric("全店總毛利", f"${total_profit:,.0f}", delta="本日即時")
+            kpi1.metric("全店總毛利", f"${total_profit:,.0f}", delta="本日累計")
             kpi2.metric("全店總門號", f"{total_cases:.0f} 件")
             kpi3.metric("平均綜合分", f"{avg_score:.1f} 分")
             kpi4.metric("資料來源", f"{len(df_all)} 間門市")
@@ -310,7 +320,6 @@ if selected_store == "(ALL) 全店總表":
             chart1, chart2 = st.columns(2)
             with chart1:
                 st.caption("各店毛利貢獻")
-                # 簡單過濾掉 0 的店
                 df_plot = df_all[df_all["毛利"] > 0]
                 if not df_plot.empty:
                     st.bar_chart(df_plot, x="門市", y="毛利", color="#FF4B4B")
@@ -327,8 +336,6 @@ if selected_store == "(ALL) 全店總表":
 
             st.subheader("📋 詳細數據列表")
             
-            # 使用 column_config 替代 style.background_gradient
-            # 這樣就不會出現 matplotlib ImportError
             column_cfg = {
                 "門市": st.column_config.TextColumn("門市名稱", disabled=True),
                 "狀態": st.column_config.TextColumn("連線狀態"),
@@ -357,7 +364,7 @@ elif selected_user == "該店總表":
     col_d1, col_d2 = st.columns([1, 2])
     view_date = col_d1.date_input("選擇報表月份", date.today(), key="date_input_store")
 
-    if col_d1.button("📂 讀取雲端報表", use_container_width=True, key="btn_load_sheet"):
+    if col_d1.button("📂 讀取完整報表", use_container_width=True, key="btn_load_sheet"):
         with st.spinner("連線 Google Sheets..."):
             sh_obj, file_msg, file_link = read_google_sheet_data(selected_store, view_date)
             if sh_obj:
@@ -389,8 +396,22 @@ elif selected_user == "該店總表":
             sh = file_data['sheet_obj']
             worksheets = sh.worksheets()
             sheet_names = [ws.title for ws in worksheets]
+            
+            # 自動選擇最可能的總表分頁
+            default_index = 0
+            possible_names = ["總表", "總計", "Total", selected_store] # 優先找 "東門店" 分頁
+            for i, name in enumerate(sheet_names):
+                if name in possible_names:
+                    default_index = i
+                    break
+            
             col_sheet, _ = st.columns([1, 2])
-            selected_sheet_name = col_sheet.selectbox("選擇要檢視的分頁", sheet_names, key="select_sheet_preview")
+            selected_sheet_name = col_sheet.selectbox(
+                "選擇要檢視的分頁", 
+                sheet_names, 
+                index=default_index, # 自動跳轉
+                key="select_sheet_preview"
+            )
             
             ws = sh.worksheet(selected_sheet_name)
             data = ws.get_all_values()
