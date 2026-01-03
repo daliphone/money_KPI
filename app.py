@@ -8,7 +8,6 @@ st.set_page_config(page_title="全店業績戰情室", layout="wide", page_icon=
 
 # 初始化 Session State
 if 'preview_data' not in st.session_state: st.session_state.preview_data = None
-if 'preview_score' not in st.session_state: st.session_state.preview_score = 0
 if 'authenticated_store' not in st.session_state: st.session_state.authenticated_store = None
 if 'admin_logged_in' not in st.session_state: st.session_state.admin_logged_in = False
 if 'current_excel_file' not in st.session_state: st.session_state.current_excel_file = None
@@ -57,7 +56,6 @@ def safe_float(value):
     """將表格內容轉為浮點數，失敗回傳 0"""
     try:
         if value in [None, "", " "]: return 0.0
-        # 移除常見的貨幣符號與逗號
         clean_val = str(value).replace(",", "").replace("$", "").replace("%", "").strip()
         if not clean_val: return 0.0
         return float(clean_val)
@@ -91,7 +89,6 @@ def update_google_sheet(store, staff, date_obj, data_dict):
             '遠傳續約': 13, '遠傳續約累積GAP': 14, 
             '遠傳升續率': 15, '遠傳平續率': 16, '綜合指標': 17
         }
-        # 這些欄位採取「覆蓋」模式
         overwrite_fields = ['遠傳續約累積GAP', '遠傳升續率', '遠傳平續率', '綜合指標']
         
         updates = []
@@ -101,7 +98,6 @@ def update_google_sheet(store, staff, date_obj, data_dict):
                 if field in overwrite_fields:
                     updates.append({'range': gspread.utils.rowcol_to_a1(target_row, col_idx), 'values': [[new_val]]})
                 else:
-                    # 讀取舊值累加
                     old_val = ws.cell(target_row, col_idx).value
                     final_val = safe_float(old_val) + new_val
                     updates.append({'range': gspread.utils.rowcol_to_a1(target_row, col_idx), 'values': [[final_val]]})
@@ -112,111 +108,47 @@ def update_google_sheet(store, staff, date_obj, data_dict):
     except Exception as e:
         return f"❌ 寫入失敗: {str(e)}"
 
-def read_google_sheet_data(store, date_obj):
+# --- 讀取特定 Sheet 的共用函式 ---
+def read_specific_sheet(filename, sheet_name):
     folder_id = st.secrets.get("TARGET_FOLDER_ID")
-    filename = f"{date_obj.year}_{date_obj.month:02d}_{store}業績日報表"
     try:
         client, drive_service = get_gspread_client()
         file_id, file_url = get_sheet_id_by_name(drive_service, filename, folder_id)
-        if not file_id: return None, f"找不到試算表：{filename}", None
+        
+        if not file_id:
+            return None, f"❌ 找不到檔案：{filename}", None
+            
         sh = client.open_by_key(file_id)
-        return sh, filename, file_url
-    except Exception as e:
-        return None, str(e), None
-
-def aggregate_all_stores_gs_monthly(date_obj):
-    """
-    (全店彙整 - 優先讀取總表版)
-    優先讀取與店名相同的分頁 (如 '東門店')，若無則讀取 '總表'，再無則加總員工。
-    """
-    folder_id = st.secrets.get("TARGET_FOLDER_ID")
-    client, drive_service = get_gspread_client()
-    
-    all_data = []
-    
-    # 讀取範圍：Day 1 (Row 15) ~ Day 31 (Row 45)
-    start_row = 15
-    end_row = 45 
-    
-    prog_bar = st.progress(0, text="正在連線雲端資料庫...")
-    total_steps = len(STORES) - 1 
-    current_step = 0
-
-    for store_name, staff_list in STORES.items():
-        if store_name == "(ALL) 全店總表": continue
+        try:
+            ws = sh.worksheet(sheet_name)
+        except gspread.WorksheetNotFound:
+            return None, f"❌ 檔案中找不到分頁：{sheet_name}", file_url
+            
+        # 讀取所有資料
+        data = ws.get_all_values()
         
-        current_step += 1
-        prog_bar.progress(int(current_step / total_steps * 100), text=f"正在讀取：{store_name}...")
-        
-        filename = f"{date_obj.year}_{date_obj.month:02d}_{store_name}業績日報表"
-        file_id, file_url = get_sheet_id_by_name(drive_service, filename, folder_id)
-        
-        store_stats = {
-            "門市": store_name,
-            "毛利": 0, "門號": 0, "保險營收": 0, "配件營收": 0, "綜合指標": 0,
-            "狀態": "❌ 缺檔"
-        }
-
-        if file_id:
-            try:
-                sh = client.open_by_key(file_id)
-                store_stats["狀態"] = "✅ 正常"
-                
-                # --- 策略：優先尋找「店總表」 ---
-                target_sheet = None
-                
-                # 1. 嘗試找跟店名一樣的分頁 (例如 "東門店")
-                try:
-                    target_sheet = sh.worksheet(store_name)
-                except:
-                    # 2. 嘗試找 "總表" 或 "Total"
-                    for backup_name in ["總表", "總計", "Total"]:
-                        try:
-                            target_sheet = sh.worksheet(backup_name)
-                            break
-                        except: pass
-                
-                # 如果找到了總表，直接讀取總表 (解決手動輸入沒反應的問題)
-                if target_sheet:
-                    data_range = target_sheet.get(f"B{start_row}:Q{end_row}")
-                    
-                    for row in data_range:
-                        if len(row) > 0:
-                            store_stats["毛利"] += safe_float(row[0]) if len(row) > 0 else 0
-                            store_stats["門號"] += safe_float(row[1]) if len(row) > 1 else 0
-                            store_stats["保險營收"] += safe_float(row[2]) if len(row) > 2 else 0
-                            store_stats["配件營收"] += safe_float(row[3]) if len(row) > 3 else 0
-                            
-                            s_score = safe_float(row[15]) if len(row) > 15 else 0
-                            if s_score > 0:
-                                # 若總表有分數，暫時累加，最後再取平均 (粗略估計)
-                                store_stats["綜合指標"] += s_score
-
-                    # 若綜合指標是累加的，顯示時可能過大，這裡假設總表上的綜合指標也是每日的
-                    # 如果讀取了 30 天，這裡簡單除以 30 (假設每天都有分) -> 這裡僅作簡單平均處理
-                    # 更精準的做法是：只讀取「昨天/今天」的列。
-                    # 但因為需求是月累計，我們就保持累加。
-                    # 注意：綜合指標如果是 0~100 分，累加會變成 3000 分。
-                    # 修正：綜合指標我們改取「最後一筆非 0 的值」(當作當前進度)
-                    last_score = 0
-                    for row in data_range:
-                        s = safe_float(row[15]) if len(row) > 15 else 0
-                        if s > 0: last_score = s
-                    store_stats["綜合指標"] = last_score
-
+        # 轉成 DataFrame
+        if len(data) > 1:
+            header = data[0]
+            rows = data[1:]
+            # 處理重複欄位名稱
+            seen = {}
+            new_header = []
+            for col in header:
+                if col in seen:
+                    seen[col] += 1
+                    new_header.append(f"{col}_{seen[col]}")
                 else:
-                    # 3. 沒總表才去加總員工 (Fallback)
-                    # (此段維持之前的邏輯，省略不重複寫，重點是上面優先讀總表)
-                    pass 
-
-            except Exception as e:
-                store_stats["狀態"] = "⚠️ 讀取錯"
-                print(e)
+                    seen[col] = 0
+                    new_header.append(col)
+            df = pd.DataFrame(rows, columns=new_header)
+        else:
+            df = pd.DataFrame(data)
+            
+        return df, "✅ 讀取成功", file_url
         
-        all_data.append(store_stats)
-    
-    prog_bar.empty()
-    return pd.DataFrame(all_data)
+    except Exception as e:
+        return None, f"❌ 讀取錯誤：{str(e)}", None
 
 # --- 3. 組織與目標 ---
 STORES = {
@@ -249,7 +181,7 @@ else:
 
 st.title(f"📊 {selected_store} - {selected_user}")
 
-# 權限驗證 (密碼輸入後按 Enter 即可)
+# 權限驗證
 def check_store_auth(current_store):
     if current_store == "(ALL) 全店總表":
         if st.session_state.admin_logged_in: return True
@@ -265,7 +197,7 @@ def check_store_auth(current_store):
     st.info(f"🔒 請輸入【{current_store}】的專屬密碼")
     with st.form("store_login"):
         input_pass = st.text_input("密碼 (輸入後按 Enter)", type="password")
-        login_btn = st.form_submit_button("登入") # 按 Enter 會觸發此按鈕
+        login_btn = st.form_submit_button("登入")
         if login_btn:
             correct_pass = st.secrets["store_passwords"].get(current_store)
             if not correct_pass: st.error("⚠️ 未設定密碼")
@@ -285,68 +217,71 @@ if not check_store_auth(selected_store):
 
 if selected_store == "(ALL) 全店總表":
     st.markdown("### 🏆 全公司業績戰情室")
-    st.info("💡 數據為「本月累計」：系統優先讀取各店「總表」分頁數據。")
     
     col_date, col_refresh = st.columns([1, 4])
     view_date = col_date.date_input("選擇檢視月份", date.today(), key="date_input_all")
     
-    if col_refresh.button("🔄 更新全店累計數據", type="primary", key="btn_refresh_all"):
-        with st.spinner("正在讀取各分店總表..."):
-            df_all = aggregate_all_stores_gs_monthly(view_date)
+    # 這裡的邏輯修改為：讀取 "(ALL)全店業績日報表" 的 "ALL" 分頁
+    if col_refresh.button("🔄 讀取全店總表 (ALL)", type="primary", key="btn_refresh_all"):
+        
+        target_filename = f"{view_date.year}_{view_date.month:02d}_(ALL)全店業績日報表"
+        target_sheet = "ALL"
+        
+        with st.spinner(f"正在讀取檔案：{target_filename} / 分頁：{target_sheet}..."):
+            df_all, msg, link = read_specific_sheet(target_filename, target_sheet)
             
-            st.divider()
-            total_profit = df_all["毛利"].sum()
-            total_cases = df_all["門號"].sum()
-            avg_score = df_all[df_all["綜合指標"] > 0]["綜合指標"].mean()
-            if pd.isna(avg_score): avg_score = 0
-            
-            kpi1, kpi2, kpi3, kpi4 = st.columns(4)
-            kpi1.metric("全店總毛利", f"${total_profit:,.0f}", delta="本月累計")
-            kpi2.metric("全店總門號", f"{total_cases:.0f} 件")
-            kpi3.metric("平均綜合分", f"{avg_score:.1f} 分")
-            kpi4.metric("資料來源", f"{len(df_all)} 間門市")
-            
-            st.subheader("📊 門市績效排行")
-            chart1, chart2 = st.columns(2)
-            with chart1:
-                st.caption("各店毛利貢獻")
-                df_plot = df_all[df_all["毛利"] > 0]
-                if not df_plot.empty:
-                    st.bar_chart(df_plot, x="門市", y="毛利", color="#FF4B4B")
-                else:
-                    st.info("尚無毛利數據")
+            if df_all is not None and not df_all.empty:
+                st.success(f"✅ 成功讀取：{target_filename}")
+                if link:
+                    st.link_button("🔗 開啟雲端原始檔", link)
+                
+                # 嘗試自動轉換數值欄位以進行計算
+                cols_to_convert = ["毛利", "門號", "綜合指標", "保險營收", "配件營收"]
+                for col in cols_to_convert:
+                    if col in df_all.columns:
+                        df_all[col] = df_all[col].apply(safe_float)
+                
+                st.divider()
+                
+                # 計算 KPI
+                total_profit = df_all["毛利"].sum() if "毛利" in df_all.columns else 0
+                total_cases = df_all["門號"].sum() if "門號" in df_all.columns else 0
+                avg_score = df_all["綜合指標"].mean() if "綜合指標" in df_all.columns else 0
+                
+                kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+                kpi1.metric("全店總毛利", f"${total_profit:,.0f}")
+                kpi2.metric("全店總門號", f"{total_cases:.0f} 件")
+                kpi3.metric("平均綜合分", f"{avg_score:.1f} 分")
+                kpi4.metric("門市數量", f"{len(df_all)} 間")
+                
+                # 圖表
+                st.subheader("📊 績效視覺化")
+                chart1, chart2 = st.columns(2)
+                
+                if "毛利" in df_all.columns and "門市" in df_all.columns:
+                    with chart1:
+                        st.caption("各店毛利排行")
+                        df_plot = df_all[df_all["毛利"] > 0].sort_values("毛利", ascending=False)
+                        st.bar_chart(df_plot, x="門市", y="毛利", color="#FF4B4B")
+                
+                if "綜合指標" in df_all.columns and "門市" in df_all.columns:
+                    with chart2:
+                        st.caption("綜合指標分析")
+                        st.bar_chart(df_all, x="門市", y="綜合指標", color="#3366CC")
 
-            with chart2:
-                st.caption("綜合指標分數")
-                df_plot_score = df_all[df_all["綜合指標"] > 0]
-                if not df_plot_score.empty:
-                    st.bar_chart(df_plot_score, x="門市", y="綜合指標", color="#3366CC")
-                else:
-                    st.info("尚無分數數據")
-
-            st.subheader("📋 詳細數據列表")
-            
-            column_cfg = {
-                "門市": st.column_config.TextColumn("門市名稱", disabled=True),
-                "狀態": st.column_config.TextColumn("連線狀態"),
-                "毛利": st.column_config.ProgressColumn(
-                    "毛利貢獻", 
-                    format="$%d", 
-                    min_value=0, 
-                    max_value=int(df_all["毛利"].max()) if not df_all.empty and df_all["毛利"].max() > 0 else 1000
-                ),
-                "門號": st.column_config.NumberColumn("門號", format="%d 件"),
-                "保險營收": st.column_config.NumberColumn("保險", format="$%d"),
-                "配件營收": st.column_config.NumberColumn("配件", format="$%d"),
-                "綜合指標": st.column_config.NumberColumn("綜合分數", format="%.1f 分"),
-            }
-            
-            st.dataframe(
-                df_all,
-                column_config=column_cfg,
-                use_container_width=True,
-                hide_index=True
-            )
+                # 表格
+                st.subheader("📋 詳細數據")
+                
+                column_cfg = {
+                    "門市": st.column_config.TextColumn("門市名稱", disabled=True),
+                    "毛利": st.column_config.ProgressColumn("毛利", format="$%d", min_value=0, max_value=int(total_profit) if total_profit > 0 else 1000),
+                    "綜合指標": st.column_config.NumberColumn("綜合分數", format="%.1f 分"),
+                }
+                
+                st.dataframe(df_all, column_config=column_cfg, use_container_width=True, hide_index=True)
+                
+            else:
+                st.error(msg)
 
 elif selected_user == "該店總表":
     st.markdown("### 📥 門市報表檢視中心")
@@ -355,85 +290,38 @@ elif selected_user == "該店總表":
     view_date = col_d1.date_input("選擇報表月份", date.today(), key="date_input_store")
 
     # 按鈕讀取
-    load_clicked = col_d1.button("📂 讀取完整報表", use_container_width=True, key="btn_load_sheet")
+    load_clicked = col_d1.button(f"📂 讀取 {selected_store} 總表", use_container_width=True, key="btn_load_sheet")
     
     if load_clicked:
-        with st.spinner("連線 Google Sheets..."):
-            sh_obj, file_msg, file_link = read_google_sheet_data(selected_store, view_date)
-            if sh_obj:
+        target_filename = f"{view_date.year}_{view_date.month:02d}_{selected_store}業績日報表"
+        # 這裡指定讀取與「店名」相同的分頁
+        target_sheet = selected_store 
+        
+        with st.spinner(f"正在讀取檔案：{target_filename} / 分頁：{target_sheet}..."):
+            df_store, msg, link = read_specific_sheet(target_filename, target_sheet)
+            
+            if df_store is not None:
                 st.session_state.current_excel_file = {
-                    'sheet_obj': sh_obj, 
-                    'name': file_msg,
-                    'link': file_link
+                    'df': df_store, 
+                    'name': target_filename,
+                    'link': link
                 }
-                st.success("✅ 試算表連線成功！")
+                st.success("✅ 讀取成功！")
             else:
-                st.error(file_msg)
+                st.error(msg)
+                if link: st.link_button("🔗 前往檔案查看", link)
     
     if st.session_state.current_excel_file:
         file_data = st.session_state.current_excel_file
         st.divider()
-        st.subheader(f"📄 試算表：{file_data['name']}")
+        st.subheader(f"📄 {file_data['name']}")
         
-        c_btn1, c_btn3 = st.columns([1, 1])
         if file_data.get('link'):
-            c_btn1.link_button("🔗 前往 Google 試算表編輯", file_data['link'], type="primary", use_container_width=True)
-        
-        if c_btn3.button("🔄 重新整理", use_container_width=True, key="btn_refresh_sheet"):
-            st.session_state.current_excel_file = None
-            st.rerun()
+            st.link_button("🔗 前往 Google 試算表編輯", file_data['link'], type="primary", use_container_width=True)
 
         st.markdown("---")
-        st.write("#### 👀 網頁內快速預覽")
-        try:
-            sh = file_data['sheet_obj']
-            worksheets = sh.worksheets()
-            sheet_names = [ws.title for ws in worksheets]
-            
-            # --- 核心修正：強制載入分頁 ---
-            # 優先順序：1.店名 2.總表 3.第一個分頁
-            default_index = 0
-            possible_names = [selected_store, "總表", "總計", "Total"]
-            
-            for i, name in enumerate(sheet_names):
-                if name in possible_names:
-                    default_index = i
-                    break
-            
-            col_sheet, _ = st.columns([1, 2])
-            selected_sheet_name = col_sheet.selectbox(
-                "選擇要檢視的分頁", 
-                sheet_names, 
-                index=default_index, 
-                key="select_sheet_preview"
-            )
-            
-            ws = sh.worksheet(selected_sheet_name)
-            data = ws.get_all_values()
-            
-            # 優化顯示：將第一列設為標題
-            if len(data) > 1:
-                header = data[0]
-                rows = data[1:]
-                # 處理欄位重複問題
-                seen = {}
-                new_header = []
-                for col in header:
-                    if col in seen:
-                        seen[col] += 1
-                        new_header.append(f"{col}_{seen[col]}")
-                    else:
-                        seen[col] = 0
-                        new_header.append(col)
-                        
-                df_preview = pd.DataFrame(rows, columns=new_header)
-            else:
-                df_preview = pd.DataFrame(data)
-                
-            st.dataframe(df_preview, use_container_width=True)
-
-        except Exception as e:
-            st.warning(f"預覽載入失敗: {str(e)}")
+        st.write(f"#### 👀 {selected_store} 分頁預覽")
+        st.dataframe(file_data['df'], use_container_width=True)
 
 else:
     # ----------------------------------------------------
