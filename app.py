@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 from datetime import date, datetime
 import time
+import re # 用於正規表示法比對檔名
 
 # --- 1. 系統初始化 ---
 st.set_page_config(page_title="全店業績戰情室", layout="wide", page_icon="📈")
@@ -17,7 +18,7 @@ if "gcp_service_account" not in st.secrets:
     st.error("❌ 嚴重錯誤：Secrets 中找不到 [gcp_service_account]。")
     st.stop()
 if "TARGET_FOLDER_ID" not in st.secrets:
-    st.warning("⚠️ 警告：Secrets 中找不到 TARGET_FOLDER_ID。")
+    st.warning("⚠️ 警告：Secrets 中找不到 TARGET_FOLDER_ID (請填入根目錄 ID)。")
 
 # 匯入 Google 套件
 try:
@@ -28,7 +29,7 @@ except ImportError:
     st.error("❌ 缺少套件，請在 requirements.txt 加入 `gspread`, `google-auth`, `google-api-python-client`")
     st.stop()
 
-# --- 2. Google Sheets 連線功能 ---
+# --- 2. Google Sheets 與 Drive 連線功能 ---
 
 @st.cache_resource
 def get_gspread_client():
@@ -43,23 +44,24 @@ def get_gspread_client():
     drive_service = build('drive', 'v3', credentials=creds)
     return client, drive_service, creds.service_account_email
 
-def check_connection_debug():
-    """(除錯用) 測試連線與權限"""
-    folder_id = st.secrets.get("TARGET_FOLDER_ID")
+def get_monthly_folder_id(drive_service, root_folder_id, date_obj):
+    """
+    (核心更新) 根據日期尋找月份資料夾 (格式: YYYYMM)
+    """
+    folder_name = date_obj.strftime("%Y%m") # 例如 202602
+    
+    query = f"name = '{folder_name}' and '{root_folder_id}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+    
     try:
-        client, drive_service, email = get_gspread_client()
-        query = f"'{folder_id}' in parents and trashed = false"
-        results = drive_service.files().list(q=query, pageSize=5, fields="files(id, name, mimeType)").execute()
+        results = drive_service.files().list(q=query, fields="files(id, name)").execute()
         files = results.get('files', [])
         
-        st.sidebar.success(f"✅ Drive 連線成功！\n機器人: {email}")
-        st.sidebar.info(f"📁 資料夾內前 5 個檔案：")
-        for f in files:
-            icon = "📊" if "spreadsheet" in f['mimeType'] else "📄"
-            st.sidebar.code(f"{icon} {f['name']} ({f['mimeType']})")
-            
+        if not files:
+            return None, f"找不到月份資料夾 [{folder_name}]"
+        
+        return files[0]['id'], None # 回傳 ID
     except Exception as e:
-        st.sidebar.error(f"❌ Drive 連線失敗：{str(e)}")
+        return None, f"搜尋資料夾錯誤: {str(e)}"
 
 def get_sheet_file_info(drive_service, filename, folder_id):
     """搜尋檔案並回傳詳細資訊"""
@@ -76,93 +78,145 @@ def get_sheet_file_info(drive_service, filename, folder_id):
         return []
 
 def safe_float(value):
-    """強力轉換數值"""
     try:
         if value in [None, "", " ", "-"]: return 0.0
-        # 移除常見的干擾字元
         clean_val = str(value).replace(",", "").replace("$", "").replace("%", "").replace(" ", "").strip()
         if not clean_val: return 0.0
         return float(clean_val)
     except ValueError:
         return 0.0
 
-def read_specific_sheet_robust(filename, sheet_name):
-    """(強健版) 讀取試算表，包含詳細錯誤診斷"""
-    folder_id = st.secrets.get("TARGET_FOLDER_ID")
+# --- 讀取與彙整邏輯 (更新版) ---
+
+def scan_and_aggregate_stores(date_obj):
+    """
+    (ALL) 掃描月份資料夾內所有 'xx店業績日報表' 並進行彙整
+    """
+    root_id = st.secrets.get("TARGET_FOLDER_ID")
     client, drive_service, email = get_gspread_client()
     
-    files_found = get_sheet_file_info(drive_service, filename, folder_id)
+    # 1. 取得月份資料夾 ID
+    month_folder_id, err = get_monthly_folder_id(drive_service, root_id, date_obj)
     
-    if not files_found:
-        return None, f"❌ 找不到檔案：[{filename}]\n請確認檔名完全一致，且機器人 ({email}) 有權限讀取該資料夾。", None
+    if not month_folder_id:
+        return None, f"❌ {err} (請確認在 Google Drive 根目錄下已建立 {date_obj.strftime('%Y%m')} 資料夾)"
     
-    target_file = None
-    excel_file = None
-    
-    for f in files_found:
-        if "application/vnd.google-apps.spreadsheet" in f['mimeType']:
-            target_file = f
-            break
-        elif "spreadsheetml.sheet" in f['mimeType']: 
-            excel_file = f
-            
-    if not target_file:
-        if excel_file:
-            return None, f"⚠️ 找到檔案 [{filename}]，但它是 Excel (.xlsx) 格式。\n請在 Google Drive 將其「另存為 Google 試算表」。", None
-        else:
-            return None, f"❌ 找到同名檔案，但格式不支援。", None
-            
-    file_id = target_file['id']
-    file_link = target_file['webViewLink']
-    
+    # 2. 列出資料夾內所有檔案
     try:
-        sh = client.open_by_key(file_id)
-    except Exception as open_err:
-        return None, f"❌ 無法開啟試算表 (ID: {file_id})。\n錯誤：{open_err}", file_link
-
-    try:
-        ws = sh.worksheet(sheet_name)
-    except gspread.WorksheetNotFound:
-        available = [s.title for s in sh.worksheets()]
-        return None, f"❌ 檔案中找不到分頁：[{sheet_name}]。\n現有分頁：{available}", file_link
-        
-    try:
-        data = ws.get_all_values()
-        if len(data) > 1:
-            header = data[0]
-            rows = data[1:]
-            seen = {}
-            new_header = []
-            for col in header:
-                # 清除標題前後空白
-                col_str = str(col).strip()
-                if col_str in seen:
-                    seen[col_str] += 1
-                    new_header.append(f"{col_str}_{seen[col_str]}")
-                else:
-                    seen[col_str] = 0
-                    new_header.append(col_str)
-            df = pd.DataFrame(rows, columns=new_header)
-        else:
-            df = pd.DataFrame(data)
-            
-        return df, "✅ 讀取成功", file_link
-        
+        # 搜尋所有 Google Sheets
+        query = f"'{month_folder_id}' in parents and mimeType = 'application/vnd.google-apps.spreadsheet' and trashed = false"
+        results = drive_service.files().list(q=query, fields="files(id, name, webViewLink)").execute()
+        all_files = results.get('files', [])
     except Exception as e:
-        return None, f"❌ 讀取數據時發生錯誤：{e}", file_link
+        return None, f"❌ 無法讀取資料夾內容: {e}"
+
+    # 3. 過濾出符合格式的檔案: YYYY_MM_xx店業績日報表
+    # 排除 (ALL) 檔案
+    target_pattern = f"{date_obj.strftime('%Y_%m')}_.+店業績日報表"
+    valid_store_files = []
+    
+    for f in all_files:
+        # 簡單過濾：檔名包含 "店業績日報表" 且不包含 "(ALL)"
+        if "店業績日報表" in f['name'] and "(ALL)" not in f['name']:
+            # 進一步確認月份 (雖然資料夾已經對了，但檢查檔名更保險)
+            if f['name'].startswith(date_obj.strftime('%Y_%m')):
+                valid_store_files.append(f)
+
+    if not valid_store_files:
+        return None, f"⚠️ 在資料夾 {date_obj.strftime('%Y%m')} 中找不到任何符合 [{target_pattern}] 的分店檔案。"
+
+    # 4. 開始逐一讀取數據
+    aggregated_data = []
+    
+    prog_bar = st.progress(0, text="開始掃描門市...")
+    total = len(valid_store_files)
+    
+    for idx, f in enumerate(valid_store_files):
+        store_name_raw = f['name'].split('_')[-1].replace('業績日報表', '') # 取得店名
+        prog_bar.progress(int((idx+1)/total * 100), text=f"正在讀取：{store_name_raw}...")
+        
+        store_stat = {
+            "門市": store_name_raw,
+            "連結": f['webViewLink'],
+            "檔案ID": f['id'],
+            # 預設值
+            "毛利": 0, "門號": 0, "保險營收": 0, "配件營收": 0,
+            "庫存手機": 0, "蘋果手機": 0, "蘋果平板+手錶": 0, "VIVO手機": 0,
+            "生活圈": 0, "GOOGLE 評論": 0, "來客數": 0,
+            "遠傳續約累積GAP": 0, "遠傳升續率": 0, "遠傳平續率": 0
+        }
+        
+        try:
+            sh = client.open_by_key(f['id'])
+            # 優先嘗試讀取與店名相同的分頁，或是 "總表"
+            target_ws = None
+            try:
+                target_ws = sh.worksheet(store_name_raw)
+            except:
+                try:
+                    target_ws = sh.worksheet("總表")
+                except: pass
+            
+            if target_ws:
+                # 讀取整月數據 (假設 Row 15 ~ 45)
+                data_range = target_ws.get("B15:S45") # 讀取足夠寬的範圍
+                
+                # 在記憶體中加總
+                for row in data_range:
+                    if len(row) > 0:
+                        # 根據您之前的 col_map: 0=毛利, 1=門號... 
+                        # col_map = {'毛利': 2 (idx0), '門號': 3 (idx1)...}
+                        store_stat["毛利"] += safe_float(row[0]) if len(row) > 0 else 0
+                        store_stat["門號"] += safe_float(row[1]) if len(row) > 1 else 0
+                        store_stat["保險營收"] += safe_float(row[2]) if len(row) > 2 else 0
+                        store_stat["配件營收"] += safe_float(row[3]) if len(row) > 3 else 0
+                        
+                        store_stat["庫存手機"] += safe_float(row[4]) if len(row) > 4 else 0
+                        store_stat["蘋果手機"] += safe_float(row[5]) if len(row) > 5 else 0
+                        store_stat["蘋果平板+手錶"] += safe_float(row[6]) if len(row) > 6 else 0
+                        store_stat["VIVO手機"] += safe_float(row[7]) if len(row) > 7 else 0
+                        
+                        store_stat["生活圈"] += safe_float(row[8]) if len(row) > 8 else 0
+                        store_stat["GOOGLE 評論"] += safe_float(row[9]) if len(row) > 9 else 0
+                        store_stat["來客數"] += safe_float(row[10]) if len(row) > 10 else 0
+                        
+                        # 續約、GAP、率 等通常取最後一筆非0，或是平均
+                        # 這裡示範取最後一筆非0 (當作當前進度)
+                        val_gap = safe_float(row[12]) if len(row) > 12 else 0
+                        val_up = safe_float(row[13]) if len(row) > 13 else 0
+                        val_flat = safe_float(row[14]) if len(row) > 14 else 0
+                        
+                        if val_gap != 0: store_stat["遠傳續約累積GAP"] = val_gap
+                        if val_up != 0: store_stat["遠傳升續率"] = val_up
+                        if val_flat != 0: store_stat["遠傳平續率"] = val_flat
+
+        except Exception as e:
+            print(f"Error reading {store_name_raw}: {e}")
+            store_stat["門市"] = f"{store_name_raw} (讀取失敗)"
+            
+        aggregated_data.append(store_stat)
+        
+    prog_bar.empty()
+    return pd.DataFrame(aggregated_data), f"✅ 成功掃描 {len(valid_store_files)} 間分店"
 
 def update_google_sheet_robust(store, staff, date_obj, data_dict):
-    """(強健版) 寫入數據"""
-    folder_id = st.secrets.get("TARGET_FOLDER_ID")
-    filename = f"{date_obj.year}_{date_obj.month:02d}_{store}業績日報表"
-    
+    """(強健版) 寫入數據 - 支援月份資料夾"""
+    root_id = st.secrets.get("TARGET_FOLDER_ID")
     client, drive_service, email = get_gspread_client()
-    files = get_sheet_file_info(drive_service, filename, folder_id)
+    
+    # 1. 取得月份資料夾
+    month_folder_id, err = get_monthly_folder_id(drive_service, root_id, date_obj)
+    if not month_folder_id:
+        return f"❌ {err}"
+    
+    # 2. 在該資料夾內搜尋檔案
+    filename = f"{date_obj.year}_{date_obj.month:02d}_{store}業績日報表"
+    files = get_sheet_file_info(drive_service, filename, month_folder_id)
     
     target_file = next((f for f in files if "google-apps.spreadsheet" in f['mimeType']), None)
     
     if not target_file:
-        return f"❌ 找不到 Google 試算表：[{filename}]"
+        return f"❌ 在 {date_obj.strftime('%Y%m')} 資料夾中找不到試算表：[{filename}]"
         
     try:
         sh = client.open_by_key(target_file['id'])
@@ -216,8 +270,10 @@ STORES = {
 
 st.sidebar.title("🏢 門市導航")
 
-if st.sidebar.button("🛠️ 測試連線 (除錯用)"):
-    check_connection_debug()
+# 除錯按鈕
+if st.sidebar.checkbox("顯示連線資訊 (Debug)"):
+    folder_id = st.secrets.get("TARGET_FOLDER_ID")
+    st.sidebar.caption(f"Root Folder ID: {folder_id}")
 
 selected_store = st.sidebar.selectbox("請選擇門市", list(STORES.keys()), key="sidebar_store_select")
 
@@ -266,121 +322,84 @@ if not check_store_auth(selected_store):
 
 if selected_store == "(ALL) 全店總表":
     st.markdown("### 🏆 全公司業績戰情室")
+    st.info("此功能會自動搜尋該月份資料夾內的所有分店報表並彙總。")
     
     col_date, col_refresh = st.columns([1, 4])
-    view_date = col_date.date_input("選擇檢視月份", date.today(), key="date_input_all")
+    view_date = col_date.date_input("選擇檢視月份 (自動對應資料夾)", date.today(), key="date_input_all")
     
-    if col_refresh.button("🔄 讀取全店總表 (ALL)", type="primary", key="btn_refresh_all"):
+    if col_refresh.button("🔄 掃描並彙整全店數據", type="primary", key="btn_refresh_all"):
         
-        target_filename = f"{view_date.year}_{view_date.month:02d}_(ALL)全店業績日報表"
-        target_sheet = "ALL"
-        
-        with st.spinner(f"正在讀取檔案：[{target_filename}] ..."):
-            df_all, msg, link = read_specific_sheet_robust(target_filename, target_sheet)
+        with st.spinner(f"正在掃描 {view_date.strftime('%Y%m')} 資料夾..."):
+            df_all, msg = scan_and_aggregate_stores(view_date)
             
             if df_all is not None and not df_all.empty:
-                st.success(f"✅ 成功讀取！")
-                if link: st.link_button("🔗 開啟雲端原始檔", link)
-                
-                # --- 資料清洗與轉換 ---
-                # 1. 移除可能的空行或「總計」行，避免計算店數錯誤
-                # 假設第一欄是「門市」或「店名」，若為空則排除
-                if "門市" in df_all.columns:
-                    df_all = df_all[df_all["門市"].str.strip() != ""]
-                    # 排除名稱含有 "總計", "Total" 的行
-                    df_all = df_all[~df_all["門市"].str.contains("總計|Total|total", na=False)]
-
-                # 2. 定義需要轉換的欄位
-                target_metrics = [
-                    "毛利", "門號", "保險營收", "配件營收", 
-                    "庫存手機", "蘋果手機", "蘋果平板+手錶", "VIVO手機",
-                    "生活圈", "GOOGLE 評論", "來客數", 
-                    "遠傳續約累積GAP", "遠傳升續率", "遠傳平續率"
-                ]
-                
-                # 3. 執行轉換 (確保欄位存在才轉)
-                for col in target_metrics:
-                    if col in df_all.columns:
-                        df_all[col] = df_all[col].apply(safe_float)
+                st.success(msg)
                 
                 st.divider()
                 
-                # --- 4. 儀表板呈現 (Dashboard Layout) ---
+                # 計算 KPI
+                total_profit = df_all["毛利"].sum()
+                total_cases = df_all["門號"].sum()
+                total_insur = df_all["保險營收"].sum()
+                store_count = len(df_all) # 這就是實際掃描到的檔案數量
                 
-                # [區塊 1] 財務與核心 (Profit & Core)
-                st.subheader("💰 財務與核心指標")
-                c1, c2, c3, c4 = st.columns(4)
-                
-                total_profit = df_all["毛利"].sum() if "毛利" in df_all.columns else 0
-                total_cases = df_all["門號"].sum() if "門號" in df_all.columns else 0
-                total_insur = df_all["保險營收"].sum() if "保險營收" in df_all.columns else 0
-                store_count = len(df_all)
-                
-                c1.metric("全店總毛利", f"${total_profit:,.0f}")
-                c2.metric("全店總門號", f"{total_cases:.0f} 件")
-                c3.metric("總保險營收", f"${total_insur:,.0f}")
-                c4.metric("營業門市數", f"{store_count} 間")
+                kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+                kpi1.metric("全店總毛利", f"${total_profit:,.0f}")
+                kpi2.metric("全店總門號", f"{total_cases:.0f} 件")
+                kpi3.metric("總保險營收", f"${total_insur:,.0f}")
+                kpi4.metric("營業門市數", f"{store_count} 間") # 這裡現在準確了
                 
                 st.markdown("---")
 
-                # [區塊 2] 硬體銷售 (Hardware)
-                st.subheader("📱 硬體銷售重點")
+                # [區塊 2] 硬體銷售
+                st.subheader("📱 硬體銷售")
                 h1, h2, h3, h4 = st.columns(4)
-                
-                t_stock = df_all["庫存手機"].sum() if "庫存手機" in df_all.columns else 0
-                t_apple = df_all["蘋果手機"].sum() if "蘋果手機" in df_all.columns else 0
-                t_ipad = df_all["蘋果平板+手錶"].sum() if "蘋果平板+手錶" in df_all.columns else 0
-                t_vivo = df_all["VIVO手機"].sum() if "VIVO手機" in df_all.columns else 0
-                
-                h1.metric("庫存手機", f"{t_stock:.0f} 台")
-                h2.metric("蘋果手機", f"{t_apple:.0f} 台")
-                h3.metric("蘋果平板+手錶", f"{t_ipad:.0f} 台")
-                h4.metric("VIVO手機", f"{t_vivo:.0f} 台")
+                h1.metric("庫存手機", f"{df_all['庫存手機'].sum():.0f}")
+                h2.metric("蘋果手機", f"{df_all['蘋果手機'].sum():.0f}")
+                h3.metric("蘋果平板+手錶", f"{df_all['蘋果平板+手錶'].sum():.0f}")
+                h4.metric("VIVO手機", f"{df_all['VIVO手機'].sum():.0f}")
                 
                 st.markdown("---")
 
-                # [區塊 3] 顧客經營與專案 (Service & KPI)
-                st.subheader("🤝 顧客經營 & 遠傳指標")
+                # [區塊 3] 顧客與專案
+                st.subheader("🤝 顧客與遠傳指標")
                 s1, s2, s3, s4, s5 = st.columns(5)
+                s1.metric("生活圈", f"{df_all['生活圈'].sum():.0f}")
+                s2.metric("Google 評論", f"{df_all['GOOGLE 評論'].sum():.0f}")
+                s3.metric("來客數", f"{df_all['來客數'].sum():.0f}")
+                s4.metric("續約 GAP", f"{df_all['遠傳續約累積GAP'].sum():.0f}")
                 
-                t_life = df_all["生活圈"].sum() if "生活圈" in df_all.columns else 0
-                t_review = df_all["GOOGLE 評論"].sum() if "GOOGLE 評論" in df_all.columns else 0
-                t_traffic = df_all["來客數"].sum() if "來客數" in df_all.columns else 0
-                t_gap = df_all["遠傳續約累積GAP"].sum() if "遠傳續約累積GAP" in df_all.columns else 0
-                
-                # 比率類通常顯示平均值 (或加權平均，這裡暫用簡單平均)
-                avg_up_rate = df_all["遠傳升續率"].mean() if "遠傳升續率" in df_all.columns else 0
-                avg_flat_rate = df_all["遠傳平續率"].mean() if "遠傳平續率" in df_all.columns else 0
-                
-                s1.metric("生活圈", f"{t_life:.0f}")
-                s2.metric("Google 評論", f"{t_review:.0f}")
-                s3.metric("來客數", f"{t_traffic:.0f}")
-                s4.metric("續約 GAP", f"{t_gap:.0f}")
-                s5.metric("平均升續率", f"{avg_up_rate*100:.1f}%") # 假設原始資料為小數點 (0.8)
+                avg_up = df_all[df_all["遠傳升續率"] > 0]["遠傳升續率"].mean()
+                if pd.isna(avg_up): avg_up = 0
+                s5.metric("平均升續率", f"{avg_up*100:.1f}%")
 
                 st.markdown("---")
 
-                # [區塊 4] 排行圖表
-                st.subheader("📊 門市毛利排行")
-                if "毛利" in df_all.columns and "門市" in df_all.columns:
-                    df_plot = df_all[df_all["毛利"] > 0].sort_values("毛利", ascending=False)
-                    st.bar_chart(df_plot, x="門市", y="毛利", color="#FF4B4B")
+                # [區塊 4] 視覺化
+                st.subheader("📊 門市排行")
+                if store_count > 0:
+                    c_chart1, c_chart2 = st.columns(2)
+                    with c_chart1:
+                        st.caption("毛利排行")
+                        st.bar_chart(df_all.set_index("門市")["毛利"].sort_values(ascending=False), color="#FF4B4B")
+                    with c_chart2:
+                        st.caption("門號件數排行")
+                        st.bar_chart(df_all.set_index("門市")["門號"].sort_values(ascending=False), color="#3366CC")
                 
-                # [區塊 5] 詳細數據表
+                # [區塊 5] 詳細數據
                 st.subheader("📋 詳細數據列表")
-                
                 column_cfg = {
                     "門市": st.column_config.TextColumn("門市名稱", disabled=True),
-                    "毛利": st.column_config.ProgressColumn("毛利", format="$%d", min_value=0, max_value=int(total_profit) if total_profit > 0 else 1000),
-                    "遠傳升續率": st.column_config.NumberColumn("升續率", format="%.1f%%"), # 若原始資料是 80 代表 80%，請改 format="%d%%"
+                    "毛利": st.column_config.ProgressColumn("毛利", format="$%d", min_value=0, max_value=int(total_profit/2) if total_profit > 0 else 1000),
+                    "遠傳升續率": st.column_config.NumberColumn("升續率", format="%.1f%%"),
                     "遠傳平續率": st.column_config.NumberColumn("平續率", format="%.1f%%"),
+                    "連結": st.column_config.LinkColumn("檔案連結")
                 }
                 
                 st.dataframe(df_all, column_config=column_cfg, use_container_width=True, hide_index=True)
                 
             else:
-                st.error(msg) 
-                if link: st.link_button("🔗 查看檔案", link)
+                st.error(msg)
 
 elif selected_user == "該店總表":
     st.markdown("### 📥 門市報表檢視中心")
@@ -391,33 +410,57 @@ elif selected_user == "該店總表":
     load_clicked = col_d1.button(f"📂 讀取 {selected_store} 總表", use_container_width=True, key="btn_load_sheet")
     
     if load_clicked:
-        target_filename = f"{view_date.year}_{view_date.month:02d}_{selected_store}業績日報表"
-        target_sheet = selected_store
+        # 強健版讀取邏輯 (含月份資料夾支援)
+        root_id = st.secrets.get("TARGET_FOLDER_ID")
+        client, drive_service, _ = get_gspread_client()
         
-        with st.spinner(f"正在讀取檔案：[{target_filename}] / 分頁：[{target_sheet}]..."):
-            df_store, msg, link = read_specific_sheet_robust(target_filename, target_sheet)
+        with st.spinner("搜尋資料夾與檔案..."):
+            month_folder_id, err = get_monthly_folder_id(drive_service, root_id, view_date)
             
-            if df_store is not None:
-                st.session_state.current_excel_file = {
-                    'df': df_store, 
-                    'name': target_filename,
-                    'link': link,
-                    'sheet': target_sheet
-                }
-                st.success("✅ 讀取成功！")
+            if not month_folder_id:
+                st.error(f"❌ {err}")
             else:
-                st.error(msg)
-                if link and "FOUND_BUT_NOT_SHEET" not in str(msg): 
-                    st.link_button("🔗 前往檔案查看 (可能分頁名稱有誤)", link)
+                filename = f"{view_date.year}_{view_date.month:02d}_{selected_store}業績日報表"
+                files = get_sheet_file_info(drive_service, filename, month_folder_id)
+                target_file = next((f for f in files if "google-apps.spreadsheet" in f['mimeType']), None)
+                
+                if not target_file:
+                    st.error(f"❌ 在 {view_date.strftime('%Y%m')} 中找不到：{filename}")
+                else:
+                    # 讀取成功
+                    try:
+                        sh = client.open_by_key(target_file['id'])
+                        # 嘗試讀取店名分頁或總表
+                        target_ws = None
+                        try:
+                            target_ws = sh.worksheet(selected_store)
+                        except:
+                            try:
+                                target_ws = sh.worksheet("總表")
+                            except: pass
+                        
+                        if target_ws:
+                            data = target_ws.get_all_values()
+                            if len(data) > 1:
+                                df = pd.DataFrame(data[1:], columns=data[0])
+                            else:
+                                df = pd.DataFrame(data)
+                                
+                            st.session_state.current_excel_file = {
+                                'df': df, 'name': filename, 'link': target_file['webViewLink']
+                            }
+                            st.success("✅ 讀取成功！")
+                        else:
+                            st.error(f"❌ 檔案中找不到 [{selected_store}] 或 [總表] 分頁")
+                            
+                    except Exception as e:
+                        st.error(f"❌ 讀取錯誤: {e}")
     
     if st.session_state.current_excel_file:
         file_data = st.session_state.current_excel_file
         st.divider()
-        st.subheader(f"📄 {file_data['name']} (分頁: {file_data.get('sheet', '未知')})")
-        
-        if file_data.get('link'):
-            st.link_button("🔗 前往 Google 試算表編輯", file_data['link'], type="primary", use_container_width=True)
-
+        st.subheader(f"📄 {file_data['name']}")
+        st.link_button("🔗 前往 Google 試算表編輯", file_data['link'], type="primary", use_container_width=True)
         st.markdown("---")
         st.dataframe(file_data['df'], use_container_width=True)
 
@@ -488,7 +531,7 @@ else:
             try:
                 data_copy = st.session_state.preview_data.copy()
                 t_date = data_copy.pop('日期')
-                my_bar.progress(50, text="連線 API...")
+                my_bar.progress(30, text="搜尋資料夾...")
                 msg = update_google_sheet_robust(selected_store, selected_user, t_date, data_copy)
                 my_bar.progress(100)
                 if "✅" in msg:
