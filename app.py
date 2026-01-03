@@ -44,13 +44,24 @@ def get_gspread_client():
 
 def get_sheet_id_by_name(drive_service, filename, folder_id):
     """搜尋檔案 ID"""
-    query = f"name = '{filename}' and trashed = false and mimeType = 'application/vnd.google-apps.spreadsheet'"
+    # 這裡放寬搜尋條件，先不檢查 mimeType，避免有些檔案被識別錯誤
+    query = f"name = '{filename}' and trashed = false"
     if folder_id:
         query += f" and '{folder_id}' in parents" 
-    results = drive_service.files().list(q=query, fields="files(id, name, webViewLink)").execute()
+    
+    # 執行搜尋
+    results = drive_service.files().list(q=query, fields="files(id, name, webViewLink, mimeType)").execute()
     items = results.get('files', [])
-    if not items: return None, None
-    return items[0]['id'], items[0]['webViewLink']
+    
+    if not items: 
+        return None, None
+    
+    # 簡單檢查是否為試算表
+    file_info = items[0]
+    if "spreadsheet" not in file_info.get('mimeType', ''):
+        return None, "FOUND_BUT_NOT_SHEET"
+
+    return file_info['id'], file_info['webViewLink']
 
 def safe_float(value):
     """將表格內容轉為浮點數，失敗回傳 0"""
@@ -70,8 +81,11 @@ def update_google_sheet(store, staff, date_obj, data_dict):
     try:
         client, drive_service = get_gspread_client()
         file_id, file_url = get_sheet_id_by_name(drive_service, filename, folder_id)
+        
+        if file_url == "FOUND_BUT_NOT_SHEET":
+            return f"❌ 找到檔案 [{filename}] 但它不是 Google 試算表格式 (可能是 Excel .xlsx)。請在 Drive 另存為試算表。"
         if not file_id:
-            return f"❌ 找不到試算表：[{filename}]。請確認已將 Excel 轉存為 Google 試算表格式。"
+            return f"❌ 找不到試算表：[{filename}]。請確認檔名與資料夾位置。"
 
         sh = client.open_by_key(file_id)
         try:
@@ -115,14 +129,21 @@ def read_specific_sheet(filename, sheet_name):
         client, drive_service = get_gspread_client()
         file_id, file_url = get_sheet_id_by_name(drive_service, filename, folder_id)
         
+        if file_url == "FOUND_BUT_NOT_SHEET":
+            return None, f"❌ 檔案 [{filename}] 存在，但它是 Excel (.xlsx) 格式。請在 Google Drive 中將其「另存為 Google 試算表」。", None
+            
         if not file_id:
-            return None, f"❌ 找不到檔案：{filename}", None
+            return None, f"❌ 在指定資料夾中找不到檔案：[{filename}]", None
             
         sh = client.open_by_key(file_id)
+        
+        # 檢查分頁是否存在
         try:
             ws = sh.worksheet(sheet_name)
         except gspread.WorksheetNotFound:
-            return None, f"❌ 檔案中找不到分頁：{sheet_name}", file_url
+            # 列出所有可用分頁，方便除錯
+            available_sheets = [s.title for s in sh.worksheets()]
+            return None, f"❌ 檔案 [{filename}] 中找不到分頁：[{sheet_name}]。現有分頁：{available_sheets}", file_url
             
         # 讀取所有資料
         data = ws.get_all_values()
@@ -135,12 +156,13 @@ def read_specific_sheet(filename, sheet_name):
             seen = {}
             new_header = []
             for col in header:
-                if col in seen:
-                    seen[col] += 1
-                    new_header.append(f"{col}_{seen[col]}")
+                col_str = str(col).strip()
+                if col_str in seen:
+                    seen[col_str] += 1
+                    new_header.append(f"{col_str}_{seen[col_str]}")
                 else:
-                    seen[col] = 0
-                    new_header.append(col)
+                    seen[col_str] = 0
+                    new_header.append(col_str)
             df = pd.DataFrame(rows, columns=new_header)
         else:
             df = pd.DataFrame(data)
@@ -148,7 +170,7 @@ def read_specific_sheet(filename, sheet_name):
         return df, "✅ 讀取成功", file_url
         
     except Exception as e:
-        return None, f"❌ 讀取錯誤：{str(e)}", None
+        return None, f"❌ 系統讀取錯誤：{str(e)}", None
 
 # --- 3. 組織與目標 ---
 STORES = {
@@ -221,21 +243,22 @@ if selected_store == "(ALL) 全店總表":
     col_date, col_refresh = st.columns([1, 4])
     view_date = col_date.date_input("選擇檢視月份", date.today(), key="date_input_all")
     
-    # 這裡的邏輯修改為：讀取 "(ALL)全店業績日報表" 的 "ALL" 分頁
+    # --- 修正 1: 讀取全店總表邏輯 ---
+    # 檔名：2026_01_(ALL)全店業績日報表
+    # 分頁：ALL
     if col_refresh.button("🔄 讀取全店總表 (ALL)", type="primary", key="btn_refresh_all"):
         
         target_filename = f"{view_date.year}_{view_date.month:02d}_(ALL)全店業績日報表"
         target_sheet = "ALL"
         
-        with st.spinner(f"正在讀取檔案：{target_filename} / 分頁：{target_sheet}..."):
+        with st.spinner(f"正在搜尋檔案：[{target_filename}] ..."):
             df_all, msg, link = read_specific_sheet(target_filename, target_sheet)
             
             if df_all is not None and not df_all.empty:
-                st.success(f"✅ 成功讀取：{target_filename}")
-                if link:
-                    st.link_button("🔗 開啟雲端原始檔", link)
+                st.success(f"✅ 成功讀取！")
+                if link: st.link_button("🔗 開啟雲端原始檔", link)
                 
-                # 嘗試自動轉換數值欄位以進行計算
+                # 嘗試自動轉換數值
                 cols_to_convert = ["毛利", "門號", "綜合指標", "保險營收", "配件營收"]
                 for col in cols_to_convert:
                     if col in df_all.columns:
@@ -254,7 +277,7 @@ if selected_store == "(ALL) 全店總表":
                 kpi3.metric("平均綜合分", f"{avg_score:.1f} 分")
                 kpi4.metric("門市數量", f"{len(df_all)} 間")
                 
-                # 圖表
+                # 圖表與表格
                 st.subheader("📊 績效視覺化")
                 chart1, chart2 = st.columns(2)
                 
@@ -264,20 +287,12 @@ if selected_store == "(ALL) 全店總表":
                         df_plot = df_all[df_all["毛利"] > 0].sort_values("毛利", ascending=False)
                         st.bar_chart(df_plot, x="門市", y="毛利", color="#FF4B4B")
                 
-                if "綜合指標" in df_all.columns and "門市" in df_all.columns:
-                    with chart2:
-                        st.caption("綜合指標分析")
-                        st.bar_chart(df_all, x="門市", y="綜合指標", color="#3366CC")
-
-                # 表格
                 st.subheader("📋 詳細數據")
-                
                 column_cfg = {
                     "門市": st.column_config.TextColumn("門市名稱", disabled=True),
                     "毛利": st.column_config.ProgressColumn("毛利", format="$%d", min_value=0, max_value=int(total_profit) if total_profit > 0 else 1000),
                     "綜合指標": st.column_config.NumberColumn("綜合分數", format="%.1f 分"),
                 }
-                
                 st.dataframe(df_all, column_config=column_cfg, use_container_width=True, hide_index=True)
                 
             else:
@@ -289,38 +304,39 @@ elif selected_user == "該店總表":
     col_d1, col_d2 = st.columns([1, 2])
     view_date = col_d1.date_input("選擇報表月份", date.today(), key="date_input_store")
 
-    # 按鈕讀取
+    # --- 修正 2: 讀取該店總表邏輯 ---
+    # 檔名：2026_01_東門店業績日報表
+    # 分頁：東門店
     load_clicked = col_d1.button(f"📂 讀取 {selected_store} 總表", use_container_width=True, key="btn_load_sheet")
     
     if load_clicked:
         target_filename = f"{view_date.year}_{view_date.month:02d}_{selected_store}業績日報表"
-        # 這裡指定讀取與「店名」相同的分頁
-        target_sheet = selected_store 
+        target_sheet = selected_store
         
-        with st.spinner(f"正在讀取檔案：{target_filename} / 分頁：{target_sheet}..."):
+        with st.spinner(f"正在讀取檔案：[{target_filename}] / 分頁：[{target_sheet}]..."):
             df_store, msg, link = read_specific_sheet(target_filename, target_sheet)
             
             if df_store is not None:
                 st.session_state.current_excel_file = {
                     'df': df_store, 
                     'name': target_filename,
-                    'link': link
+                    'link': link,
+                    'sheet': target_sheet
                 }
                 st.success("✅ 讀取成功！")
             else:
                 st.error(msg)
-                if link: st.link_button("🔗 前往檔案查看", link)
+                if link: st.link_button("🔗 前往檔案查看 (可能分頁名稱有誤)", link)
     
     if st.session_state.current_excel_file:
         file_data = st.session_state.current_excel_file
         st.divider()
-        st.subheader(f"📄 {file_data['name']}")
+        st.subheader(f"📄 {file_data['name']} (分頁: {file_data.get('sheet', '未知')})")
         
         if file_data.get('link'):
             st.link_button("🔗 前往 Google 試算表編輯", file_data['link'], type="primary", use_container_width=True)
 
         st.markdown("---")
-        st.write(f"#### 👀 {selected_store} 分頁預覽")
         st.dataframe(file_data['df'], use_container_width=True)
 
 else:
