@@ -25,7 +25,7 @@ try:
     from google.oauth2.service_account import Credentials
     from googleapiclient.discovery import build 
 except ImportError:
-    st.error("❌ 缺少套件，請在 requirements.txt 加入 `gspread`")
+    st.error("❌ 缺少必要套件，請檢查 requirements.txt 是否包含：gspread, google-auth, google-api-python-client")
     st.stop()
 
 # --- 2. Google Sheets 連線功能 ---
@@ -40,28 +40,40 @@ def get_gspread_client():
     creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
     client = gspread.authorize(creds)
     drive_service = build('drive', 'v3', credentials=creds)
-    return client, drive_service
+    return client, drive_service, creds.service_account_email
+
+def debug_list_files(drive_service, folder_id):
+    """(除錯用) 列出資料夾內前 5 個檔案"""
+    try:
+        query = f"'{folder_id}' in parents and trashed = false"
+        results = drive_service.files().list(q=query, pageSize=10, fields="files(id, name, mimeType)").execute()
+        files = results.get('files', [])
+        return files
+    except Exception as e:
+        return f"無法列出檔案: {str(e)}"
 
 def get_sheet_id_by_name(drive_service, filename, folder_id):
     """搜尋檔案 ID"""
-    # 這裡放寬搜尋條件，先不檢查 mimeType，避免有些檔案被識別錯誤
+    # 嚴格比對檔名 (不含副檔名，因為 Google Sheet 在 API 中沒有 .xlsx 後綴)
     query = f"name = '{filename}' and trashed = false"
     if folder_id:
         query += f" and '{folder_id}' in parents" 
     
-    # 執行搜尋
-    results = drive_service.files().list(q=query, fields="files(id, name, webViewLink, mimeType)").execute()
-    items = results.get('files', [])
-    
-    if not items: 
-        return None, None
-    
-    # 簡單檢查是否為試算表
-    file_info = items[0]
-    if "spreadsheet" not in file_info.get('mimeType', ''):
-        return None, "FOUND_BUT_NOT_SHEET"
+    try:
+        results = drive_service.files().list(q=query, fields="files(id, name, webViewLink, mimeType)").execute()
+        items = results.get('files', [])
+        
+        if not items: 
+            return None, "NOT_FOUND"
+        
+        # 檢查是否為 Google Sheet
+        file_info = items[0]
+        if "spreadsheet" not in file_info.get('mimeType', ''):
+            return None, "FOUND_BUT_NOT_SHEET" # 找到同名檔案但它是 Excel/Word 等
 
-    return file_info['id'], file_info['webViewLink']
+        return file_info['id'], file_info['webViewLink']
+    except Exception as e:
+        return None, f"API_ERROR: {str(e)}"
 
 def safe_float(value):
     """將表格內容轉為浮點數，失敗回傳 0"""
@@ -79,13 +91,15 @@ def update_google_sheet(store, staff, date_obj, data_dict):
     filename = f"{date_obj.year}_{date_obj.month:02d}_{store}業績日報表"
 
     try:
-        client, drive_service = get_gspread_client()
+        client, drive_service, email = get_gspread_client()
         file_id, file_url = get_sheet_id_by_name(drive_service, filename, folder_id)
         
+        if file_url == "NOT_FOUND":
+            return f"❌ 找不到檔案：[{filename}]。請確認檔名是否完全一致 (Google Sheet 不需 .xlsx 副檔名)。"
         if file_url == "FOUND_BUT_NOT_SHEET":
-            return f"❌ 找到檔案 [{filename}] 但它不是 Google 試算表格式 (可能是 Excel .xlsx)。請在 Drive 另存為試算表。"
-        if not file_id:
-            return f"❌ 找不到試算表：[{filename}]。請確認檔名與資料夾位置。"
+            return f"❌ 找到檔案 [{filename}] 但它是 Excel (.xlsx)。請在 Drive 點右鍵 > 選擇「Google 試算表」開啟 > 另存為 Google 試算表。"
+        if str(file_url).startswith("API_ERROR"):
+            return f"❌ API 搜尋錯誤：{file_url}"
 
         sh = client.open_by_key(file_id)
         try:
@@ -93,7 +107,6 @@ def update_google_sheet(store, staff, date_obj, data_dict):
         except gspread.WorksheetNotFound:
             return f"❌ 找不到人員分頁：[{staff}]"
 
-        # 寫入邏輯：Day 1 = Row 15
         target_row = 15 + (date_obj.day - 1)
         
         col_map = {
@@ -120,39 +133,47 @@ def update_google_sheet(store, staff, date_obj, data_dict):
         return f"✅ 資料已成功寫入：{filename}"
 
     except Exception as e:
-        return f"❌ 寫入失敗: {str(e)}"
+        return f"❌ 系統錯誤: {str(e)}"
 
 # --- 讀取特定 Sheet 的共用函式 ---
 def read_specific_sheet(filename, sheet_name):
     folder_id = st.secrets.get("TARGET_FOLDER_ID")
     try:
-        client, drive_service = get_gspread_client()
+        client, drive_service, email = get_gspread_client()
         file_id, file_url = get_sheet_id_by_name(drive_service, filename, folder_id)
         
+        # 詳細錯誤處理
+        if file_url == "NOT_FOUND":
+            # 除錯：列出資料夾內有的檔案，幫使用者找原因
+            files_in_folder = debug_list_files(drive_service, folder_id)
+            file_names = [f['name'] for f in files_in_folder] if isinstance(files_in_folder, list) else str(files_in_folder)
+            return None, f"❌ 找不到檔案：[{filename}]\n\n🔍 機器人 ({email}) 在您的資料夾中只看到這些檔案：\n{file_names}", None
+            
         if file_url == "FOUND_BUT_NOT_SHEET":
-            return None, f"❌ 檔案 [{filename}] 存在，但它是 Excel (.xlsx) 格式。請在 Google Drive 中將其「另存為 Google 試算表」。", None
+            return None, f"❌ 格式錯誤：檔案 [{filename}] 存在，但它是 Excel (.xlsx)。請務必在 Google Drive 將其「另存為 Google 試算表」。", None
             
-        if not file_id:
-            return None, f"❌ 在指定資料夾中找不到檔案：[{filename}]", None
+        if str(file_url).startswith("API_ERROR"):
+            return None, f"❌ Google API 連線失敗：{file_url}", None
             
-        sh = client.open_by_key(file_id)
-        
-        # 檢查分頁是否存在
+        # 嘗試開啟
+        try:
+            sh = client.open_by_key(file_id)
+        except Exception as open_err:
+             return None, f"❌ 無法開啟試算表 (ID: {file_id})。請確認您已將檔案共用給：{email}\n錯誤訊息：{open_err}", None
+
+        # 嘗試讀取分頁
         try:
             ws = sh.worksheet(sheet_name)
         except gspread.WorksheetNotFound:
-            # 列出所有可用分頁，方便除錯
             available_sheets = [s.title for s in sh.worksheets()]
-            return None, f"❌ 檔案 [{filename}] 中找不到分頁：[{sheet_name}]。現有分頁：{available_sheets}", file_url
+            return None, f"❌ 檔案 [{filename}] 中找不到分頁：[{sheet_name}]。\n現有分頁：{available_sheets}", file_url
             
-        # 讀取所有資料
+        # 讀取資料
         data = ws.get_all_values()
         
-        # 轉成 DataFrame
         if len(data) > 1:
             header = data[0]
             rows = data[1:]
-            # 處理重複欄位名稱
             seen = {}
             new_header = []
             for col in header:
@@ -170,7 +191,7 @@ def read_specific_sheet(filename, sheet_name):
         return df, "✅ 讀取成功", file_url
         
     except Exception as e:
-        return None, f"❌ 系統讀取錯誤：{str(e)}", None
+        return None, f"❌ 未知系統錯誤：{str(e)}", None
 
 # --- 3. 組織與目標 ---
 STORES = {
@@ -189,11 +210,8 @@ STORES = {
 # --- 4. 介面與權限邏輯 ---
 
 st.sidebar.title("🏢 門市導航")
-
-# 4.1 選擇門市
 selected_store = st.sidebar.selectbox("請選擇門市", list(STORES.keys()), key="sidebar_store_select")
 
-# 4.2 選擇人員
 if selected_store == "(ALL) 全店總表":
     selected_user = "全店總覽"
     staff_options = []
@@ -243,9 +261,7 @@ if selected_store == "(ALL) 全店總表":
     col_date, col_refresh = st.columns([1, 4])
     view_date = col_date.date_input("選擇檢視月份", date.today(), key="date_input_all")
     
-    # --- 修正 1: 讀取全店總表邏輯 ---
-    # 檔名：2026_01_(ALL)全店業績日報表
-    # 分頁：ALL
+    # 強制讀取：2026_01_(ALL)全店業績日報表 / 分頁：ALL
     if col_refresh.button("🔄 讀取全店總表 (ALL)", type="primary", key="btn_refresh_all"):
         
         target_filename = f"{view_date.year}_{view_date.month:02d}_(ALL)全店業績日報表"
@@ -258,7 +274,7 @@ if selected_store == "(ALL) 全店總表":
                 st.success(f"✅ 成功讀取！")
                 if link: st.link_button("🔗 開啟雲端原始檔", link)
                 
-                # 嘗試自動轉換數值
+                # 自動轉換數值
                 cols_to_convert = ["毛利", "門號", "綜合指標", "保險營收", "配件營收"]
                 for col in cols_to_convert:
                     if col in df_all.columns:
@@ -277,7 +293,6 @@ if selected_store == "(ALL) 全店總表":
                 kpi3.metric("平均綜合分", f"{avg_score:.1f} 分")
                 kpi4.metric("門市數量", f"{len(df_all)} 間")
                 
-                # 圖表與表格
                 st.subheader("📊 績效視覺化")
                 chart1, chart2 = st.columns(2)
                 
@@ -296,7 +311,7 @@ if selected_store == "(ALL) 全店總表":
                 st.dataframe(df_all, column_config=column_cfg, use_container_width=True, hide_index=True)
                 
             else:
-                st.error(msg)
+                st.error(msg) # 這裡會顯示詳細的除錯訊息
 
 elif selected_user == "該店總表":
     st.markdown("### 📥 門市報表檢視中心")
@@ -304,9 +319,7 @@ elif selected_user == "該店總表":
     col_d1, col_d2 = st.columns([1, 2])
     view_date = col_d1.date_input("選擇報表月份", date.today(), key="date_input_store")
 
-    # --- 修正 2: 讀取該店總表邏輯 ---
-    # 檔名：2026_01_東門店業績日報表
-    # 分頁：東門店
+    # 強制讀取：2026_01_{店名}業績日報表 / 分頁：{店名}
     load_clicked = col_d1.button(f"📂 讀取 {selected_store} 總表", use_container_width=True, key="btn_load_sheet")
     
     if load_clicked:
@@ -325,8 +338,9 @@ elif selected_user == "該店總表":
                 }
                 st.success("✅ 讀取成功！")
             else:
-                st.error(msg)
-                if link: st.link_button("🔗 前往檔案查看 (可能分頁名稱有誤)", link)
+                st.error(msg) # 這裡會顯示詳細的除錯訊息
+                if link and "FOUND_BUT_NOT_SHEET" not in str(msg): 
+                    st.link_button("🔗 前往檔案查看 (可能分頁名稱有誤)", link)
     
     if st.session_state.current_excel_file:
         file_data = st.session_state.current_excel_file
