@@ -25,11 +25,12 @@ try:
     from google.oauth2.service_account import Credentials
     from googleapiclient.discovery import build 
 except ImportError:
-    st.error("❌ 缺少必要套件，請檢查 requirements.txt 是否包含：gspread, google-auth, google-api-python-client")
+    st.error("❌ 缺少套件，請在 requirements.txt 加入 `gspread`, `google-auth`, `google-api-python-client`")
     st.stop()
 
 # --- 2. Google Sheets 連線功能 ---
 
+@st.cache_resource
 def get_gspread_client():
     """建立 gspread 客戶端與 Drive API 服務"""
     scopes = [
@@ -42,19 +43,30 @@ def get_gspread_client():
     drive_service = build('drive', 'v3', credentials=creds)
     return client, drive_service, creds.service_account_email
 
-def debug_list_files(drive_service, folder_id):
-    """(除錯用) 列出資料夾內前 5 個檔案"""
+def check_connection_debug():
+    """(除錯用) 測試連線與權限"""
+    folder_id = st.secrets.get("TARGET_FOLDER_ID")
     try:
+        client, drive_service, email = get_gspread_client()
+        # 嘗試列出資料夾內的檔案
         query = f"'{folder_id}' in parents and trashed = false"
-        results = drive_service.files().list(q=query, pageSize=10, fields="files(id, name, mimeType)").execute()
+        results = drive_service.files().list(q=query, pageSize=5, fields="files(id, name, mimeType)").execute()
         files = results.get('files', [])
-        return files
+        
+        st.sidebar.success(f"✅ 連線成功！\n機器人: {email}")
+        st.sidebar.info(f"📁 資料夾內前 5 個檔案：")
+        for f in files:
+            icon = "📊" if "spreadsheet" in f['mimeType'] else "📄"
+            st.sidebar.code(f"{icon} {f['name']} ({f['mimeType']})")
+            
     except Exception as e:
-        return f"無法列出檔案: {str(e)}"
+        st.sidebar.error(f"❌ 連線失敗：{str(e)}")
 
-def get_sheet_id_by_name(drive_service, filename, folder_id):
-    """搜尋檔案 ID"""
-    # 嚴格比對檔名 (不含副檔名，因為 Google Sheet 在 API 中沒有 .xlsx 後綴)
+def get_sheet_file_info(drive_service, filename, folder_id):
+    """
+    搜尋檔案並回傳詳細資訊 (ID, Link, MimeType)
+    """
+    # 搜尋同名檔案 (不分格式)
     query = f"name = '{filename}' and trashed = false"
     if folder_id:
         query += f" and '{folder_id}' in parents" 
@@ -62,21 +74,12 @@ def get_sheet_id_by_name(drive_service, filename, folder_id):
     try:
         results = drive_service.files().list(q=query, fields="files(id, name, webViewLink, mimeType)").execute()
         items = results.get('files', [])
-        
-        if not items: 
-            return None, "NOT_FOUND"
-        
-        # 檢查是否為 Google Sheet
-        file_info = items[0]
-        if "spreadsheet" not in file_info.get('mimeType', ''):
-            return None, "FOUND_BUT_NOT_SHEET" # 找到同名檔案但它是 Excel/Word 等
-
-        return file_info['id'], file_info['webViewLink']
+        return items
     except Exception as e:
-        return None, f"API_ERROR: {str(e)}"
+        st.error(f"API 搜尋錯誤: {e}")
+        return []
 
 def safe_float(value):
-    """將表格內容轉為浮點數，失敗回傳 0"""
     try:
         if value in [None, "", " "]: return 0.0
         clean_val = str(value).replace(",", "").replace("$", "").replace("%", "").strip()
@@ -85,92 +88,53 @@ def safe_float(value):
     except ValueError:
         return 0.0
 
-def update_google_sheet(store, staff, date_obj, data_dict):
-    """寫入單一門市單一人員數據"""
+def read_specific_sheet_robust(filename, sheet_name):
+    """(強健版) 讀取試算表，包含詳細錯誤診斷"""
     folder_id = st.secrets.get("TARGET_FOLDER_ID")
-    filename = f"{date_obj.year}_{date_obj.month:02d}_{store}業績日報表"
-
+    client, drive_service, email = get_gspread_client()
+    
+    # 1. 搜尋檔案
+    files_found = get_sheet_file_info(drive_service, filename, folder_id)
+    
+    if not files_found:
+        return None, f"❌ 找不到檔案：[{filename}]\n請確認檔名完全一致，且機器人 ({email}) 有權限讀取該資料夾。", None
+    
+    # 2. 檢查檔案格式
+    target_file = None
+    excel_file = None
+    
+    for f in files_found:
+        if "application/vnd.google-apps.spreadsheet" in f['mimeType']:
+            target_file = f
+            break
+        elif "spreadsheetml.sheet" in f['mimeType']: # Excel .xlsx
+            excel_file = f
+            
+    if not target_file:
+        if excel_file:
+            return None, f"⚠️ 找到檔案 [{filename}]，但它是 Excel (.xlsx) 格式。\n\n請依照以下步驟解決：\n1. 到 Google Drive 打開該檔案\n2. 點選「檔案」>「儲存為 Google 試算表」\n3. 確保新檔案名稱正確", None
+        else:
+            return None, f"❌ 找到同名檔案，但格式不支援 (MimeType: {files_found[0]['mimeType']})", None
+            
+    # 3. 開啟試算表
+    file_id = target_file['id']
+    file_link = target_file['webViewLink']
+    
     try:
-        client, drive_service, email = get_gspread_client()
-        file_id, file_url = get_sheet_id_by_name(drive_service, filename, folder_id)
-        
-        if file_url == "NOT_FOUND":
-            return f"❌ 找不到檔案：[{filename}]。請確認檔名是否完全一致 (Google Sheet 不需 .xlsx 副檔名)。"
-        if file_url == "FOUND_BUT_NOT_SHEET":
-            return f"❌ 找到檔案 [{filename}] 但它是 Excel (.xlsx)。請在 Drive 點右鍵 > 選擇「Google 試算表」開啟 > 另存為 Google 試算表。"
-        if str(file_url).startswith("API_ERROR"):
-            return f"❌ API 搜尋錯誤：{file_url}"
-
         sh = client.open_by_key(file_id)
-        try:
-            ws = sh.worksheet(staff)
-        except gspread.WorksheetNotFound:
-            return f"❌ 找不到人員分頁：[{staff}]"
-
-        target_row = 15 + (date_obj.day - 1)
-        
-        col_map = {
-            '毛利': 2, '門號': 3, '保險營收': 4, '配件營收': 5,
-            '庫存手機': 6, '蘋果手機': 7, '蘋果平板+手錶': 8, 'VIVO手機': 9,
-            '生活圈': 10, 'GOOGLE 評論': 11, '來客數': 12,
-            '遠傳續約': 13, '遠傳續約累積GAP': 14, 
-            '遠傳升續率': 15, '遠傳平續率': 16, '綜合指標': 17
-        }
-        overwrite_fields = ['遠傳續約累積GAP', '遠傳升續率', '遠傳平續率', '綜合指標']
-        
-        updates = []
-        for field, new_val in data_dict.items():
-            if field in col_map and new_val is not None:
-                col_idx = col_map[field]
-                if field in overwrite_fields:
-                    updates.append({'range': gspread.utils.rowcol_to_a1(target_row, col_idx), 'values': [[new_val]]})
-                else:
-                    old_val = ws.cell(target_row, col_idx).value
-                    final_val = safe_float(old_val) + new_val
-                    updates.append({'range': gspread.utils.rowcol_to_a1(target_row, col_idx), 'values': [[final_val]]})
-
-        if updates: ws.batch_update(updates)
-        return f"✅ 資料已成功寫入：{filename}"
-
     except Exception as e:
-        return f"❌ 系統錯誤: {str(e)}"
+        return None, f"❌ 無法開啟試算表 (ID: {file_id})。\n錯誤訊息：{e}", file_link
 
-# --- 讀取特定 Sheet 的共用函式 ---
-def read_specific_sheet(filename, sheet_name):
-    folder_id = st.secrets.get("TARGET_FOLDER_ID")
+    # 4. 讀取分頁
     try:
-        client, drive_service, email = get_gspread_client()
-        file_id, file_url = get_sheet_id_by_name(drive_service, filename, folder_id)
+        ws = sh.worksheet(sheet_name)
+    except gspread.WorksheetNotFound:
+        available = [s.title for s in sh.worksheets()]
+        return None, f"❌ 檔案中找不到分頁：[{sheet_name}]。\n現有分頁：{available}", file_link
         
-        # 詳細錯誤處理
-        if file_url == "NOT_FOUND":
-            # 除錯：列出資料夾內有的檔案，幫使用者找原因
-            files_in_folder = debug_list_files(drive_service, folder_id)
-            file_names = [f['name'] for f in files_in_folder] if isinstance(files_in_folder, list) else str(files_in_folder)
-            return None, f"❌ 找不到檔案：[{filename}]\n\n🔍 機器人 ({email}) 在您的資料夾中只看到這些檔案：\n{file_names}", None
-            
-        if file_url == "FOUND_BUT_NOT_SHEET":
-            return None, f"❌ 格式錯誤：檔案 [{filename}] 存在，但它是 Excel (.xlsx)。請務必在 Google Drive 將其「另存為 Google 試算表」。", None
-            
-        if str(file_url).startswith("API_ERROR"):
-            return None, f"❌ Google API 連線失敗：{file_url}", None
-            
-        # 嘗試開啟
-        try:
-            sh = client.open_by_key(file_id)
-        except Exception as open_err:
-             return None, f"❌ 無法開啟試算表 (ID: {file_id})。請確認您已將檔案共用給：{email}\n錯誤訊息：{open_err}", None
-
-        # 嘗試讀取分頁
-        try:
-            ws = sh.worksheet(sheet_name)
-        except gspread.WorksheetNotFound:
-            available_sheets = [s.title for s in sh.worksheets()]
-            return None, f"❌ 檔案 [{filename}] 中找不到分頁：[{sheet_name}]。\n現有分頁：{available_sheets}", file_url
-            
-        # 讀取資料
+    # 5. 轉換數據
+    try:
         data = ws.get_all_values()
-        
         if len(data) > 1:
             header = data[0]
             rows = data[1:]
@@ -188,10 +152,57 @@ def read_specific_sheet(filename, sheet_name):
         else:
             df = pd.DataFrame(data)
             
-        return df, "✅ 讀取成功", file_url
+        return df, "✅ 讀取成功", file_link
         
     except Exception as e:
-        return None, f"❌ 未知系統錯誤：{str(e)}", None
+        return None, f"❌ 讀取數據時發生錯誤：{e}", file_link
+
+def update_google_sheet_robust(store, staff, date_obj, data_dict):
+    """(強健版) 寫入數據"""
+    folder_id = st.secrets.get("TARGET_FOLDER_ID")
+    filename = f"{date_obj.year}_{date_obj.month:02d}_{store}業績日報表"
+    
+    client, drive_service, email = get_gspread_client()
+    files = get_sheet_file_info(drive_service, filename, folder_id)
+    
+    target_file = next((f for f in files if "google-apps.spreadsheet" in f['mimeType']), None)
+    
+    if not target_file:
+        return f"❌ 找不到 Google 試算表：[{filename}] (若只有 Excel 檔請先轉存)"
+        
+    try:
+        sh = client.open_by_key(target_file['id'])
+        ws = sh.worksheet(staff)
+        
+        target_row = 15 + (date_obj.day - 1)
+        
+        col_map = {
+            '毛利': 2, '門號': 3, '保險營收': 4, '配件營收': 5,
+            '庫存手機': 6, '蘋果手機': 7, '蘋果平板+手錶': 8, 'VIVO手機': 9,
+            '生活圈': 10, 'GOOGLE 評論': 11, '來客數': 12,
+            '遠傳續約': 13, '遠傳續約累積GAP': 14, 
+            '遠傳升續率': 15, '遠傳平續率': 16, '綜合指標': 17
+        }
+        overwrite = ['遠傳續約累積GAP', '遠傳升續率', '遠傳平續率', '綜合指標']
+        
+        updates = []
+        for field, new_val in data_dict.items():
+            if field in col_map and new_val is not None:
+                col_idx = col_map[field]
+                if field in overwrite:
+                    updates.append({'range': gspread.utils.rowcol_to_a1(target_row, col_idx), 'values': [[new_val]]})
+                else:
+                    old_val = ws.cell(target_row, col_idx).value
+                    final_val = safe_float(old_val) + new_val
+                    updates.append({'range': gspread.utils.rowcol_to_a1(target_row, col_idx), 'values': [[final_val]]})
+
+        if updates: ws.batch_update(updates)
+        return f"✅ 資料已成功寫入：{filename}"
+        
+    except gspread.WorksheetNotFound:
+        return f"❌ 找不到人員分頁：[{staff}]"
+    except Exception as e:
+        return f"❌ 寫入錯誤：{str(e)}"
 
 # --- 3. 組織與目標 ---
 STORES = {
@@ -210,6 +221,11 @@ STORES = {
 # --- 4. 介面與權限邏輯 ---
 
 st.sidebar.title("🏢 門市導航")
+
+# 除錯按鈕
+if st.sidebar.button("🛠️ 測試連線 (除錯用)"):
+    check_connection_debug()
+
 selected_store = st.sidebar.selectbox("請選擇門市", list(STORES.keys()), key="sidebar_store_select")
 
 if selected_store == "(ALL) 全店總表":
@@ -261,14 +277,13 @@ if selected_store == "(ALL) 全店總表":
     col_date, col_refresh = st.columns([1, 4])
     view_date = col_date.date_input("選擇檢視月份", date.today(), key="date_input_all")
     
-    # 強制讀取：2026_01_(ALL)全店業績日報表 / 分頁：ALL
     if col_refresh.button("🔄 讀取全店總表 (ALL)", type="primary", key="btn_refresh_all"):
         
         target_filename = f"{view_date.year}_{view_date.month:02d}_(ALL)全店業績日報表"
         target_sheet = "ALL"
         
         with st.spinner(f"正在搜尋檔案：[{target_filename}] ..."):
-            df_all, msg, link = read_specific_sheet(target_filename, target_sheet)
+            df_all, msg, link = read_specific_sheet_robust(target_filename, target_sheet)
             
             if df_all is not None and not df_all.empty:
                 st.success(f"✅ 成功讀取！")
@@ -311,7 +326,8 @@ if selected_store == "(ALL) 全店總表":
                 st.dataframe(df_all, column_config=column_cfg, use_container_width=True, hide_index=True)
                 
             else:
-                st.error(msg) # 這裡會顯示詳細的除錯訊息
+                st.error(msg) 
+                if link: st.link_button("🔗 查看檔案", link)
 
 elif selected_user == "該店總表":
     st.markdown("### 📥 門市報表檢視中心")
@@ -319,7 +335,6 @@ elif selected_user == "該店總表":
     col_d1, col_d2 = st.columns([1, 2])
     view_date = col_d1.date_input("選擇報表月份", date.today(), key="date_input_store")
 
-    # 強制讀取：2026_01_{店名}業績日報表 / 分頁：{店名}
     load_clicked = col_d1.button(f"📂 讀取 {selected_store} 總表", use_container_width=True, key="btn_load_sheet")
     
     if load_clicked:
@@ -327,7 +342,7 @@ elif selected_user == "該店總表":
         target_sheet = selected_store
         
         with st.spinner(f"正在讀取檔案：[{target_filename}] / 分頁：[{target_sheet}]..."):
-            df_store, msg, link = read_specific_sheet(target_filename, target_sheet)
+            df_store, msg, link = read_specific_sheet_robust(target_filename, target_sheet)
             
             if df_store is not None:
                 st.session_state.current_excel_file = {
@@ -338,14 +353,13 @@ elif selected_user == "該店總表":
                 }
                 st.success("✅ 讀取成功！")
             else:
-                st.error(msg) # 這裡會顯示詳細的除錯訊息
-                if link and "FOUND_BUT_NOT_SHEET" not in str(msg): 
-                    st.link_button("🔗 前往檔案查看 (可能分頁名稱有誤)", link)
+                st.error(msg)
+                if link: st.link_button("🔗 前往檔案查看", link)
     
     if st.session_state.current_excel_file:
         file_data = st.session_state.current_excel_file
         st.divider()
-        st.subheader(f"📄 {file_data['name']} (分頁: {file_data.get('sheet', '未知')})")
+        st.subheader(f"📄 {file_data['name']}")
         
         if file_data.get('link'):
             st.link_button("🔗 前往 Google 試算表編輯", file_data['link'], type="primary", use_container_width=True)
@@ -421,7 +435,7 @@ else:
                 data_copy = st.session_state.preview_data.copy()
                 t_date = data_copy.pop('日期')
                 my_bar.progress(50, text="連線 API...")
-                msg = update_google_sheet(selected_store, selected_user, t_date, data_copy)
+                msg = update_google_sheet_robust(selected_store, selected_user, t_date, data_copy)
                 my_bar.progress(100)
                 if "✅" in msg:
                     st.success(msg)
