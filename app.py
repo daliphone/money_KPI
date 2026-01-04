@@ -158,13 +158,6 @@ def scan_and_aggregate_stores(date_obj):
                 except: pass
             
             if ws:
-                # 讀取 B15:S45
-                # Index mapping (0-based from B column):
-                # 0:毛利, 1:門號, 2:保險, 3:配件
-                # 4:庫存, 5:蘋果, 6:iPad, 7:VIVO
-                # 8:生活, 9:評論, 10:來客
-                # 11:遠傳續約(件) [新增]
-                # 12:GAP, 13:升續, 14:平續
                 data = ws.get("B15:S45")
                 for row in data:
                     if len(row) > 0:
@@ -183,8 +176,6 @@ def scan_and_aggregate_stores(date_obj):
                         stat["來客數"] += safe_float(row[10]) if len(row)>10 else 0
                         
                         stat["遠傳續約"] += safe_float(row[11]) if len(row)>11 else 0
-                        
-                        # 這些指標通常取最後一筆非0值
                         v_gap = safe_float(row[12]) if len(row)>12 else 0
                         v_up = safe_float(row[13]) if len(row)>13 else 0
                         v_flat = safe_float(row[14]) if len(row)>14 else 0
@@ -215,10 +206,6 @@ def update_google_sheet_robust(store, staff, date_obj, data_dict):
         ws = sh.worksheet(staff)
         target_row = 15 + (date_obj.day - 1)
         
-        # B=2 ... M=13 ... R=18 (原本綜合17, 因加入續約件數往後推嗎? 
-        # 依照您的確認: 遠傳續約(件) 在 GAP 前面
-        # 假設 Excel 結構: ... 來客(L), 續約件(M), GAP(N), 升續(O), 平續(P), 綜合(Q)
-        # L=12, M=13, N=14, O=15, P=16, Q=17
         col_map = {
             '毛利': 2, '門號': 3, '保險營收': 4, '配件營收': 5,
             '庫存手機': 6, '蘋果手機': 7, '蘋果平板+手錶': 8, 'VIVO手機': 9,
@@ -319,7 +306,8 @@ with st.sidebar.expander("⚙️ 系統資訊 (版本紀錄)", expanded=False):
     
     ---
     **📜 版本歷程：**
-    * **v15.0 (Current)**：修正全店總表連結問題、指標分類重組、增加遠傳續約件數顯示。
+    * **v15.1 (Current)**：修復該店總表密碼輸入框遺失問題。
+    * **v15.0**：修正全店總表連結問題、指標分類重組、增加遠傳續約件數顯示。
     * **v14.1**：系統資訊區塊位置調整。
     * **v14.0**：動態讀取人員名單、指標名稱修正。
     * **v13.0**：欄位除重、UI 連線燈號。
@@ -329,7 +317,7 @@ with st.sidebar.expander("⚙️ 系統資訊 (版本紀錄)", expanded=False):
 
 st.title(f"📊 {selected_store} - {selected_user}")
 
-# 權限驗證
+# 權限驗證 (修復重點)
 def check_store_auth(current_store):
     if current_store == "(ALL) 全店總表":
         if st.session_state.admin_logged_in: return True
@@ -339,12 +327,20 @@ def check_store_auth(current_store):
              st.session_state.admin_logged_in = True
              st.rerun()
         return False
+    
     if st.session_state.authenticated_store == current_store: return True
+    
     st.info(f"🔒 請輸入【{current_store}】的專屬密碼")
     with st.form("store_login"):
+        # [Fix] 補回輸入框，讀取 st.secrets["store_passwords"]
+        input_pass = st.text_input("密碼", type="password")
         if st.form_submit_button("登入"):
-            pwd = st.secrets["store_passwords"].get(current_store)
-            if pwd: st.session_state.authenticated_store = current_store; st.rerun()
+            correct_pass = st.secrets["store_passwords"].get(current_store)
+            if input_pass == correct_pass:
+                st.session_state.authenticated_store = current_store
+                st.rerun()
+            else:
+                st.error("❌ 密碼錯誤")
     return False
 
 if not check_store_auth(selected_store): st.stop()
@@ -364,7 +360,7 @@ if selected_store == "(ALL) 全店總表":
                 st.success(msg)
                 st.divider()
                 
-                # 1. 毛利與門號 (樣式與硬體銷售一致)
+                # 1. 毛利與門號
                 st.subheader("💰 毛利與門號")
                 tp = df_all["毛利"].sum(); tc = df_all["門號"].sum(); ti = df_all["保險營收"].sum()
                 k1, k2, k3, k4 = st.columns(4)
@@ -385,7 +381,7 @@ if selected_store == "(ALL) 全店總表":
                 
                 st.markdown("---")
                 
-                # 3. 顧客經營 (拆分)
+                # 3. 顧客經營
                 st.subheader("🤝 顧客經營")
                 s1, s2, s3 = st.columns(3)
                 s1.metric("生活圈", f"{df_all['生活圈'].sum():.0f} 人")
@@ -394,7 +390,7 @@ if selected_store == "(ALL) 全店總表":
                 
                 st.markdown("---")
                 
-                # 4. 遠傳專案指標 (拆分)
+                # 4. 遠傳專案指標
                 st.subheader("📡 遠傳專案指標")
                 f1, f2, f3, f4 = st.columns(4)
                 f1.metric("遠傳續約", f"{df_all['遠傳續約'].sum():.0f} 件")
@@ -408,12 +404,12 @@ if selected_store == "(ALL) 全店總表":
                 
                 st.markdown("---")
                 
-                # 5. 詳細報表 (連結修正)
+                # 5. 詳細報表
                 st.subheader("📋 詳細分店報表")
                 column_cfg = {
                     "門市": st.column_config.TextColumn("門市名稱", disabled=True),
                     "毛利": st.column_config.ProgressColumn("毛利", format="$%d", min_value=0, max_value=int(tp/2) if tp > 0 else 1000),
-                    "連結": st.column_config.LinkColumn("檔案連結", display_text="🔗 開啟") # 修正連結顯示
+                    "連結": st.column_config.LinkColumn("檔案連結", display_text="🔗 開啟")
                 }
                 st.dataframe(df_all, column_config=column_cfg, use_container_width=True, hide_index=True)
             else: st.error(msg)
