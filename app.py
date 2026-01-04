@@ -57,7 +57,7 @@ def get_working_folder_id(drive_service, root_folder_id, date_obj):
         results = drive_service.files().list(q=query, fields="files(id, name)").execute()
         files = results.get('files', [])
         if files: return files[0]['id']
-        else: return root_folder_id # 找不到則回退根目錄
+        else: return root_folder_id 
     except: return root_folder_id
 
 def get_sheet_file_info(drive_service, filename, folder_id):
@@ -91,7 +91,7 @@ def make_columns_unique(columns):
 
 # --- 核心邏輯：動態讀取 Excel 分頁作為人員名單 ---
 
-@st.cache_data(ttl=60) # 快取 60 秒
+@st.cache_data(ttl=60)
 def fetch_dynamic_staff_list(store_name, date_obj):
     if store_name == "(ALL) 全店總表": return []
     
@@ -146,7 +146,7 @@ def scan_and_aggregate_stores(date_obj):
             "毛利": 0, "門號": 0, "保險營收": 0, "配件營收": 0,
             "庫存手機": 0, "蘋果手機": 0, "蘋果平板+手錶": 0, "VIVO手機": 0,
             "生活圈": 0, "GOOGLE 評論": 0, "來客數": 0,
-            "遠傳續約累積GAP": 0, "遠傳升續率": 0, "遠傳平續率": 0
+            "遠傳續約": 0, "遠傳續約累積GAP": 0, "遠傳升續率": 0, "遠傳平續率": 0
         }
         
         try:
@@ -158,6 +158,13 @@ def scan_and_aggregate_stores(date_obj):
                 except: pass
             
             if ws:
+                # 讀取 B15:S45
+                # Index mapping (0-based from B column):
+                # 0:毛利, 1:門號, 2:保險, 3:配件
+                # 4:庫存, 5:蘋果, 6:iPad, 7:VIVO
+                # 8:生活, 9:評論, 10:來客
+                # 11:遠傳續約(件) [新增]
+                # 12:GAP, 13:升續, 14:平續
                 data = ws.get("B15:S45")
                 for row in data:
                     if len(row) > 0:
@@ -175,6 +182,9 @@ def scan_and_aggregate_stores(date_obj):
                         stat["GOOGLE 評論"] += safe_float(row[9]) if len(row)>9 else 0
                         stat["來客數"] += safe_float(row[10]) if len(row)>10 else 0
                         
+                        stat["遠傳續約"] += safe_float(row[11]) if len(row)>11 else 0
+                        
+                        # 這些指標通常取最後一筆非0值
                         v_gap = safe_float(row[12]) if len(row)>12 else 0
                         v_up = safe_float(row[13]) if len(row)>13 else 0
                         v_flat = safe_float(row[14]) if len(row)>14 else 0
@@ -190,7 +200,6 @@ def scan_and_aggregate_stores(date_obj):
     return pd.DataFrame(aggregated_data), f"✅ 掃描完成：{len(valid_files)} 間門市"
 
 def update_google_sheet_robust(store, staff, date_obj, data_dict):
-    """寫入數據"""
     root_id = st.secrets.get("TARGET_FOLDER_ID")
     client, drive_service, _ = get_gspread_client()
     folder_id = get_working_folder_id(drive_service, root_id, date_obj)
@@ -206,6 +215,10 @@ def update_google_sheet_robust(store, staff, date_obj, data_dict):
         ws = sh.worksheet(staff)
         target_row = 15 + (date_obj.day - 1)
         
+        # B=2 ... M=13 ... R=18 (原本綜合17, 因加入續約件數往後推嗎? 
+        # 依照您的確認: 遠傳續約(件) 在 GAP 前面
+        # 假設 Excel 結構: ... 來客(L), 續約件(M), GAP(N), 升續(O), 平續(P), 綜合(Q)
+        # L=12, M=13, N=14, O=15, P=16, Q=17
         col_map = {
             '毛利': 2, '門號': 3, '保險營收': 4, '配件營收': 5,
             '庫存手機': 6, '蘋果手機': 7, '蘋果平板+手錶': 8, 'VIVO手機': 9,
@@ -231,7 +244,6 @@ def update_google_sheet_robust(store, staff, date_obj, data_dict):
     except Exception as e: return f"❌ 寫入錯誤：{e}"
 
 def read_sheet_robust_v13(store, date_obj):
-    """讀取單店"""
     root_id = st.secrets.get("TARGET_FOLDER_ID")
     client, drive_service, _ = get_gspread_client()
     folder_id = get_working_folder_id(drive_service, root_id, date_obj)
@@ -298,7 +310,7 @@ else:
         
     selected_user = st.sidebar.selectbox("請選擇人員", staff_options, key="sidebar_user_select")
 
-# Footer (系統資訊 - 置底)
+# Footer (系統資訊)
 st.sidebar.markdown("---")
 with st.sidebar.expander("⚙️ 系統資訊 (版本紀錄)", expanded=False):
     st.markdown("""
@@ -307,12 +319,12 @@ with st.sidebar.expander("⚙️ 系統資訊 (版本紀錄)", expanded=False):
     
     ---
     **📜 版本歷程：**
-    * **v14.1 (Current)**：系統資訊區塊位置調整、完整版本紀錄回朔。
-    * **v14.0**：動態讀取人員名單、指標名稱與單位修正。
-    * **v13.0**：欄位除重 (Duplicate Columns fix)、UI 連線燈號。
-    * **v12.0**：智慧資料夾搜尋 (支援根目錄 Fallback)、全店總表自動掃描。
+    * **v15.0 (Current)**：修正全店總表連結問題、指標分類重組、增加遠傳續約件數顯示。
+    * **v14.1**：系統資訊區塊位置調整。
+    * **v14.0**：動態讀取人員名單、指標名稱修正。
+    * **v13.0**：欄位除重、UI 連線燈號。
+    * **v12.0**：智慧資料夾搜尋。
     * **v11.0**：自動分月資料夾歸檔邏輯。
-    * **v10.0**：儀表板視覺化優化、資料清洗。
     """)
 
 st.title(f"📊 {selected_store} - {selected_user}")
@@ -352,7 +364,8 @@ if selected_store == "(ALL) 全店總表":
                 st.success(msg)
                 st.divider()
                 
-                # KPI
+                # 1. 毛利與門號 (樣式與硬體銷售一致)
+                st.subheader("💰 毛利與門號")
                 tp = df_all["毛利"].sum(); tc = df_all["門號"].sum(); ti = df_all["保險營收"].sum()
                 k1, k2, k3, k4 = st.columns(4)
                 k1.metric("全店總毛利", f"${tp:,.0f}")
@@ -361,28 +374,48 @@ if selected_store == "(ALL) 全店總表":
                 k4.metric("營業門市數", f"{len(df_all)} 間")
                 
                 st.markdown("---")
-                # 硬體
+                
+                # 2. 硬體銷售
                 st.subheader("📱 硬體銷售")
                 h1, h2, h3, h4 = st.columns(4)
-                h1.metric("庫存手機", f"{df_all['庫存手機'].sum():.0f}")
-                h2.metric("蘋果手機", f"{df_all['蘋果手機'].sum():.0f}")
-                h3.metric("蘋果平板/手錶", f"{df_all['蘋果平板+手錶'].sum():.0f}")
-                h4.metric("VIVO手機", f"{df_all['VIVO手機'].sum():.0f}")
+                h1.metric("庫存手機", f"{df_all['庫存手機'].sum():.0f} 台")
+                h2.metric("蘋果手機", f"{df_all['蘋果手機'].sum():.0f} 台")
+                h3.metric("蘋果平板/手錶", f"{df_all['蘋果平板+手錶'].sum():.0f} 台")
+                h4.metric("VIVO手機", f"{df_all['VIVO手機'].sum():.0f} 台")
                 
                 st.markdown("---")
-                # 顧客
-                st.subheader("🤝 顧客與遠傳")
-                s1, s2, s3, s4, s5 = st.columns(5)
+                
+                # 3. 顧客經營 (拆分)
+                st.subheader("🤝 顧客經營")
+                s1, s2, s3 = st.columns(3)
                 s1.metric("生活圈", f"{df_all['生活圈'].sum():.0f} 人")
                 s2.metric("Google 評論", f"{df_all['GOOGLE 評論'].sum():.0f} 則")
                 s3.metric("來客數", f"{df_all['來客數'].sum():.0f} 人")
-                s4.metric("續約 GAP", f"{df_all['遠傳續約累積GAP'].sum():.0f}")
-                
-                avg_up = df_all[df_all["遠傳升續率"]>0]["遠傳升續率"].mean()
-                s5.metric("平均升續率", f"{avg_up*100:.1f}%" if not pd.isna(avg_up) else "0%")
                 
                 st.markdown("---")
-                st.dataframe(df_all, use_container_width=True, hide_index=True)
+                
+                # 4. 遠傳專案指標 (拆分)
+                st.subheader("📡 遠傳專案指標")
+                f1, f2, f3, f4 = st.columns(4)
+                f1.metric("遠傳續約", f"{df_all['遠傳續約'].sum():.0f} 件")
+                f2.metric("續約 GAP", f"{df_all['遠傳續約累積GAP'].sum():.0f}")
+                
+                avg_up = df_all[df_all["遠傳升續率"]>0]["遠傳升續率"].mean()
+                f3.metric("升續率", f"{avg_up*100:.1f}%" if not pd.isna(avg_up) else "0%")
+                
+                avg_flat = df_all[df_all["遠傳平續率"]>0]["遠傳平續率"].mean()
+                f4.metric("平續率", f"{avg_flat*100:.1f}%" if not pd.isna(avg_flat) else "0%")
+                
+                st.markdown("---")
+                
+                # 5. 詳細報表 (連結修正)
+                st.subheader("📋 詳細分店報表")
+                column_cfg = {
+                    "門市": st.column_config.TextColumn("門市名稱", disabled=True),
+                    "毛利": st.column_config.ProgressColumn("毛利", format="$%d", min_value=0, max_value=int(tp/2) if tp > 0 else 1000),
+                    "連結": st.column_config.LinkColumn("檔案連結", display_text="🔗 開啟") # 修正連結顯示
+                }
+                st.dataframe(df_all, column_config=column_cfg, use_container_width=True, hide_index=True)
             else: st.error(msg)
 
 elif selected_user == "該店總表":
@@ -402,6 +435,7 @@ elif selected_user == "該店總表":
         st.dataframe(f['df'], use_container_width=True)
 
 else:
+    # 個人填寫
     st.markdown(f"### 📝 {selected_user} - {view_date.strftime('%Y-%m')} 業績回報")
     
     with st.form("daily_input_full"):
