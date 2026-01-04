@@ -233,6 +233,7 @@ def update_google_sheet_robust(store, staff, date_obj, data_dict):
 def read_sheet_robust_v13(store, date_obj):
     root_id = st.secrets.get("TARGET_FOLDER_ID")
     client, drive_service, _ = get_gspread_client()
+    # 這裡會根據 date_obj 去找對應的月份資料夾 (或根目錄)
     folder_id = get_working_folder_id(drive_service, root_id, date_obj)
     
     filename = f"{date_obj.year}_{date_obj.month:02d}_{store}業績日報表"
@@ -285,8 +286,11 @@ if selected_store == "(ALL) 全店總表":
     selected_user = "全店總覽"
     staff_options = []
 else:
+    # 這裡的 view_date 是 Sidebar 的全域設定，會決定讀取哪一個月的資料夾
     view_date = st.sidebar.date_input("設定工作月份", date.today(), key="sidebar_date_picker")
+    
     with st.spinner("讀取人員名單..."):
+        # 動態人員名單也會根據 view_date 去抓對應月份的檔案
         dynamic_staff = fetch_dynamic_staff_list(selected_store, view_date)
     
     if dynamic_staff:
@@ -306,18 +310,16 @@ with st.sidebar.expander("⚙️ 系統資訊 (版本紀錄)", expanded=False):
     
     ---
     **📜 版本歷程：**
-    * **v15.1 (Current)**：修復該店總表密碼輸入框遺失問題。
-    * **v15.0**：修正全店總表連結問題、指標分類重組、增加遠傳續約件數顯示。
-    * **v14.1**：系統資訊區塊位置調整。
-    * **v14.0**：動態讀取人員名單、指標名稱修正。
-    * **v13.0**：欄位除重、UI 連線燈號。
+    * **v15.2 (Current)**：修復「該店總表」月份選擇不同步問題 (移除重複 Date Picker)。
+    * **v15.1**：修復該店總表密碼輸入框遺失問題。
+    * **v15.0**：修正全店總表連結問題、指標分類重組。
+    * **v14.0**：動態讀取人員名單。
     * **v12.0**：智慧資料夾搜尋。
-    * **v11.0**：自動分月資料夾歸檔邏輯。
     """)
 
 st.title(f"📊 {selected_store} - {selected_user}")
 
-# 權限驗證 (修復重點)
+# 權限驗證
 def check_store_auth(current_store):
     if current_store == "(ALL) 全店總表":
         if st.session_state.admin_logged_in: return True
@@ -332,7 +334,6 @@ def check_store_auth(current_store):
     
     st.info(f"🔒 請輸入【{current_store}】的專屬密碼")
     with st.form("store_login"):
-        # [Fix] 補回輸入框，讀取 st.secrets["store_passwords"]
         input_pass = st.text_input("密碼", type="password")
         if st.form_submit_button("登入"):
             correct_pass = st.secrets["store_passwords"].get(current_store)
@@ -351,11 +352,12 @@ if not check_store_auth(selected_store): st.stop()
 
 if selected_store == "(ALL) 全店總表":
     st.markdown("### 🏆 全公司業績戰情室")
-    view_date = st.date_input("選擇檢視月份", date.today(), key="main_date_input")
+    # 這裡維持獨立的日期選擇，因為全店總表可能想看跟側邊欄不同的月份
+    view_date_all = st.date_input("選擇檢視月份", date.today(), key="main_date_input")
     
     if st.button("🔄 掃描並彙整全店數據", type="primary"):
-        with st.spinner(f"正在掃描 {view_date.strftime('%Y%m')} 資料..."):
-            df_all, msg = scan_and_aggregate_stores(view_date)
+        with st.spinner(f"正在掃描 {view_date_all.strftime('%Y%m')} 資料..."):
+            df_all, msg = scan_and_aggregate_stores(view_date_all)
             if df_all is not None and not df_all.empty:
                 st.success(msg)
                 st.divider()
@@ -416,8 +418,13 @@ if selected_store == "(ALL) 全店總表":
 
 elif selected_user == "該店總表":
     st.markdown("### 📥 門市報表檢視中心")
+    
+    # [Fix v15.2] 移除這裡重複的 date_input，直接顯示 Sidebar 的 view_date
+    st.info(f"目前設定工作月份：**{view_date.strftime('%Y年%m月')}** (如需切換請在左側選擇)")
+    
     if st.button(f"📂 讀取 {selected_store} 總表", use_container_width=True):
         with st.spinner("讀取中..."):
+            # 使用 Sidebar 的 view_date，這樣就會去讀取正確的月份資料夾
             df, fname, link = read_sheet_robust_v13(selected_store, view_date)
             if df is not None:
                 st.session_state.current_excel_file = {'df': df, 'name': fname, 'link': link}
@@ -436,6 +443,8 @@ else:
     
     with st.form("daily_input_full"):
         d_col1, d_col2 = st.columns([1, 3])
+        # 這裡的 input_date 預設為今天，但通常使用者填寫業績都是填「當日」或「補昨天的」
+        # 您可以保持預設為 date.today()
         input_date = d_col1.date_input("📅 報表日期", date.today())
         st.markdown("---")
 
