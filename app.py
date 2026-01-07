@@ -11,6 +11,7 @@ if 'preview_data' not in st.session_state: st.session_state.preview_data = None
 if 'authenticated_store' not in st.session_state: st.session_state.authenticated_store = None
 if 'admin_logged_in' not in st.session_state: st.session_state.admin_logged_in = False
 if 'current_excel_file' not in st.session_state: st.session_state.current_excel_file = None
+if 'kpi_config' not in st.session_state: st.session_state.kpi_config = None # 緩存設定
 
 # 檢查 Secrets
 if "gcp_service_account" not in st.secrets:
@@ -29,41 +30,27 @@ except ImportError:
     st.stop()
 
 # ==============================================================================
-# ⚙️ 中央參數設定區 (KPI CONFIG) - 未來增減欄位改這裡即可！
+# ⚙️ 預設設定 (Fallback) - 當雲端設定檔讀取失敗時使用
 # ==============================================================================
-# 格式： "欄位名稱": {"col": Excel欄位索引(0-based), "type": "類型", "cat": "分類"}
-# Excel 對應：A=0, B=1, C=2 ... I=8, J=9, K=10, L=11 ...
-# ------------------------------------------------------------------------------
-KPI_CONFIG = {
-    # [財務與門號]
+DEFAULT_KPI_CONFIG = {
     "毛利":       {"col": 0,  "type": "money",  "cat": "finance", "label": "毛利 ($)"},
     "門號":       {"col": 1,  "type": "int",    "cat": "finance", "label": "門號 (件)"},
     "保險營收":   {"col": 2,  "type": "money",  "cat": "finance", "label": "保險營收 ($)"},
     "配件營收":   {"col": 3,  "type": "money",  "cat": "finance", "label": "配件營收 ($)"},
-    
-    # [硬體銷售] (舊有)
     "庫存手機":   {"col": 4,  "type": "int",    "cat": "hardware", "label": "庫存手機 (台)"},
     "蘋果手機":   {"col": 5,  "type": "int",    "cat": "hardware", "label": "蘋果手機 (台)"},
     "蘋果平板+手錶": {"col": 6, "type": "int",  "cat": "hardware", "label": "蘋果平板/手錶 (台)"},
-    
-    # [重點目標銷售] (I, J, K, L)
     "華為穿戴":     {"col": 7,  "type": "int",    "cat": "target",   "label": "華為穿戴 (台)"},
     "橙艾玻璃貼":   {"col": 8,  "type": "int",    "cat": "target",   "label": "橙艾玻璃貼 (張)"},
     "VIVO銷售目標": {"col": 9,  "type": "int",    "cat": "target",   "label": "VIVO銷售目標 (台)"},
     "GPLUS吸塵器":  {"col": 10, "type": "int",    "cat": "target",   "label": "GPLUS吸塵器 (台)"},
-
-    # [顧客經營] (Shifted M, N, O, P)
     "生活圈":       {"col": 11, "type": "int",    "cat": "service",  "label": "生活圈 (人)"},
     "GOOGLE 評論":  {"col": 12, "type": "int",    "cat": "service",  "label": "Google 評論 (則)"},
     "來客數":       {"col": 13, "type": "int",    "cat": "service",  "label": "來客數 (人)"},
-
-    # [遠傳專案] (Shifted Q, R, S, T)
     "遠傳續約":        {"col": 14, "type": "int",    "cat": "project",  "label": "遠傳續約 (件)"},
     "遠傳續約累積GAP": {"col": 15, "type": "int",    "cat": "project",  "label": "續約累積 GAP"},
     "遠傳升續率":      {"col": 16, "type": "percent","cat": "project",  "label": "升續率 (%)", "mode": "overwrite"},
     "遠傳平續率":      {"col": 17, "type": "percent","cat": "project",  "label": "平續率 (%)", "mode": "overwrite"},
-    
-    # [綜合] (U)
     "綜合指標":        {"col": 18, "type": "float",  "cat": "score",    "label": "綜合指標分數", "mode": "overwrite"}
 }
 
@@ -83,6 +70,58 @@ def check_connection_status():
         _, _, email = get_gspread_client()
         return True, email
     except: return False, None
+
+# --- 核心：動態載入設定檔 (v17.0 Feature) ---
+def load_system_config():
+    """
+    嘗試從 Google Drive 讀取 'system_kpi_config' 試算表。
+    若失敗則回傳預設設定。
+    """
+    if st.session_state.kpi_config:
+        return st.session_state.kpi_config
+
+    folder_id = st.secrets.get("TARGET_FOLDER_ID")
+    client, drive_service, _ = get_gspread_client()
+    
+    # 搜尋設定檔
+    query = f"name = 'system_kpi_config' and trashed = false and '{folder_id}' in parents"
+    try:
+        results = drive_service.files().list(q=query, fields="files(id)").execute()
+        files = results.get('files', [])
+        
+        if files:
+            sh = client.open_by_key(files[0]['id'])
+            ws = sh.worksheet("Config")
+            data = ws.get_all_records() # 預設第一列為標題
+            
+            new_config = {}
+            for row in data:
+                # 簡單的資料驗證
+                key = str(row.get('名稱', '')).strip()
+                if not key: continue
+                
+                new_config[key] = {
+                    "col": int(row.get('Excel欄位(0起始)', 0)),
+                    "type": str(row.get('類型', 'int')),
+                    "cat": str(row.get('分類', 'finance')),
+                    "label": str(row.get('顯示標籤', key)),
+                    "mode": str(row.get('模式', ''))
+                }
+            
+            st.session_state.kpi_config = new_config
+            # print("✅ 成功載入雲端設定檔")
+            return new_config
+            
+    except Exception as e:
+        print(f"⚠️ 讀取設定檔失敗 ({e})，使用預設設定。")
+    
+    st.session_state.kpi_config = DEFAULT_KPI_CONFIG
+    return DEFAULT_KPI_CONFIG
+
+# 載入設定 (全域變數)
+KPI_CONFIG = load_system_config()
+
+# --- 一般工具函式 ---
 
 def get_working_folder_id(drive_service, root_folder_id, date_obj):
     folder_name = date_obj.strftime("%Y%m")
@@ -123,8 +162,6 @@ def make_columns_unique(columns):
             new_columns.append(col_name)
     return new_columns
 
-# --- 核心邏輯：動態讀取 Excel 分頁 ---
-
 @st.cache_data(ttl=60)
 def fetch_dynamic_staff_list(store_name, date_obj):
     if store_name == "(ALL) 全店總表": return []
@@ -142,7 +179,7 @@ def fetch_dynamic_staff_list(store_name, date_obj):
         return [s for s in all_sheets if s not in exclude_list]
     except: return []
 
-# --- 讀取與彙整功能 (使用 KPI_CONFIG 自動對應) ---
+# --- 讀取與彙整功能 (使用動態 CONFIG) ---
 
 def scan_and_aggregate_stores(date_obj):
     root_id = st.secrets.get("TARGET_FOLDER_ID")
@@ -163,14 +200,20 @@ def scan_and_aggregate_stores(date_obj):
     aggregated_data = []
     prog_bar = st.progress(0, text="掃描中...")
     
+    # 動態計算需要讀取的最大欄位數 (避免讀太少)
+    max_col_index = max([v['col'] for v in KPI_CONFIG.values()]) + 2 # +2 offset just in case
+    # 轉換成 Excel 欄位字母 (簡易版，支援到 Z)
+    end_char = chr(65 + max_col_index + 1) # B is index 1, so offset
+    if max_col_index > 24: end_char = "Z" # Fallback simplicity
+    
+    range_str = f"B15:{end_char}45"
+
     for idx, f in enumerate(valid_files):
         store_name = f['name'].split('_')[-1].replace('業績日報表', '')
         prog_bar.progress(int((idx+1)/len(valid_files)*100), text=f"讀取：{store_name}")
         
-        # 初始化統計字典
         stat = {"門市": store_name, "連結": f['webViewLink']}
-        for key in KPI_CONFIG:
-            stat[key] = 0
+        for key in KPI_CONFIG: stat[key] = 0
         
         try:
             sh = client.open_by_key(f['id'])
@@ -181,19 +224,15 @@ def scan_and_aggregate_stores(date_obj):
                 except: pass
             
             if ws:
-                # 讀取範圍動態判斷：從 B15 到 最後一欄 (目前到 U=20, 讀到 W 保險)
-                data = ws.get("B15:W45")
+                data = ws.get(range_str)
                 for row in data:
                     if len(row) > 0:
                         for key, cfg in KPI_CONFIG.items():
                             col_idx = cfg['col']
                             val = safe_float(row[col_idx]) if len(row) > col_idx else 0
-                            
-                            # 如果是覆蓋型 (比率/GAP)，取最後一筆非 0
                             if cfg.get('mode') == 'overwrite':
                                 if val != 0: stat[key] = val
                             else:
-                                # 累加型
                                 stat[key] += val
 
         except Exception as e: print(e)
@@ -222,9 +261,7 @@ def update_google_sheet_robust(store, staff, date_obj, data_dict):
         for field, new_val in data_dict.items():
             if field in KPI_CONFIG and new_val is not None:
                 cfg = KPI_CONFIG[field]
-                # 轉回 Excel 欄位索引 (config 是 0-based，gspread 是 1-based, 但 B 欄是 Start, 所以 col=0 -> B=2)
-                # B欄是第 2 欄，所以 gspread col = config_col + 2
-                col_idx = cfg['col'] + 2
+                col_idx = cfg['col'] + 2 # B=2
                 
                 if cfg.get('mode') == 'overwrite':
                     updates.append({'range': gspread.utils.rowcol_to_a1(target_row, col_idx), 'values': [[new_val]]})
@@ -244,7 +281,6 @@ def read_sheet_robust_v13(store, date_obj):
     filename = f"{date_obj.year}_{date_obj.month:02d}_{store}業績日報表"
     files = get_sheet_file_info(drive_service, filename, folder_id)
     target_file = next((f for f in files if "google-apps.spreadsheet" in f['mimeType']), None)
-    
     if not target_file: return None, f"找不到檔案：{filename}", None
     try:
         sh = client.open_by_key(target_file['id'])
@@ -299,10 +335,13 @@ with st.sidebar.expander("⚙️ 系統資訊", expanded=False):
     st.markdown("""
     **馬尼門市業績戰情表**
     © 2025 Money KPI
-    **v16.0 旗艦版：**
-    * 架構升級：導入中央參數設定 (KPI_CONFIG)，未來增減欄位只需修改設定區。
-    * 介面美化：全店總表導入分頁 (Tabs) 設計。
+    **v17.0 雲端設定版：**
+    * 系統優先讀取 Google Drive 上的 `system_kpi_config` 設定檔。
+    * 若無設定檔，則使用內建的 v15.6 預設值。
     """)
+    if st.button("🔄 重新載入設定檔"):
+        st.session_state.kpi_config = None
+        st.rerun()
 
 st.title(f"📊 {selected_store} - {selected_user}")
 
@@ -343,7 +382,6 @@ if selected_store == "(ALL) 全店總表":
             if df_all is not None and not df_all.empty:
                 st.success(msg)
                 
-                # --- 頂部關鍵指標 (Key Metrics) ---
                 total_profit = df_all["毛利"].sum()
                 total_cases = df_all["門號"].sum()
                 store_count = len(df_all)
@@ -355,7 +393,6 @@ if selected_store == "(ALL) 全店總表":
                 
                 st.divider()
 
-                # --- 分頁顯示 (Tabs) ---
                 tab1, tab2, tab3, tab4, tab5 = st.tabs([
                     "💰 財務概況", "🎯 重點目標", "🤝 顧客經營", "📡 遠傳專案", "📋 詳細報表"
                 ])
@@ -364,19 +401,15 @@ if selected_store == "(ALL) 全店總表":
                     c1, c2, c3 = st.columns(3)
                     c1.metric("保險營收", f"${df_all['保險營收'].sum():,.0f}")
                     c2.metric("配件營收", f"${df_all['配件營收'].sum():,.0f}")
-                    # 毛利已在上面顯示，這裡可以放佔比圖或其他
                     
                 with tab2:
                     st.caption("含硬體銷售與推廣目標")
-                    # 自動從 CONFIG 取出所有 'hardware' 和 'target' 類別
                     target_cols = [k for k, v in KPI_CONFIG.items() if v['cat'] in ['hardware', 'target']]
-                    # 4 column grid
                     cols = st.columns(4)
                     for i, key in enumerate(target_cols):
                         with cols[i % 4]:
                             val = df_all[key].sum()
                             label = KPI_CONFIG[key]['label']
-                            # 簡化標籤顯示 (去掉單位括號，讓畫面乾淨)
                             display_label = label.split(" (")[0]
                             st.metric(display_label, f"{val:,.0f}")
                             
@@ -432,8 +465,7 @@ else:
         input_date = d_col1.date_input("📅 報表日期", date.today())
         st.markdown("---")
         
-        # 動態生成表單 (根據 KPI_CONFIG 分類)
-        # 1. 財務 (Finance)
+        # 動態生成表單
         st.subheader("💰 財務與門號")
         fin_items = [k for k,v in KPI_CONFIG.items() if v['cat'] == 'finance']
         cols = st.columns(len(fin_items))
@@ -441,57 +473,47 @@ else:
         for i, key in enumerate(fin_items):
             inputs[key] = cols[i].number_input(KPI_CONFIG[key]['label'], min_value=0, step=1 if KPI_CONFIG[key]['type']=='int' else 100)
 
-        # 2. 重點目標銷售 (Hardware + Target)
         st.subheader("🎯 重點目標銷售")
         tgt_items = [k for k,v in KPI_CONFIG.items() if v['cat'] in ['hardware', 'target']]
-        # Split into rows of 4
         for i in range(0, len(tgt_items), 4):
             batch = tgt_items[i:i+4]
             cols = st.columns(4)
             for j, key in enumerate(batch):
                 inputs[key] = cols[j].number_input(KPI_CONFIG[key]['label'], min_value=0, step=1)
         
-        # 3. 顧客經營 (Service)
         st.subheader("🤝 顧客經營")
         svc_items = [k for k,v in KPI_CONFIG.items() if v['cat'] == 'service']
         cols = st.columns(len(svc_items))
         for i, key in enumerate(svc_items):
             inputs[key] = cols[i].number_input(KPI_CONFIG[key]['label'], min_value=0, step=1)
 
-        # 4. 專案 (Project)
         st.subheader("📡 遠傳專案指標")
         prj_items = [k for k,v in KPI_CONFIG.items() if v['cat'] == 'project']
         cols = st.columns(len(prj_items))
         for i, key in enumerate(prj_items):
-            # 百分比特殊處理
             if KPI_CONFIG[key]['type'] == 'percent':
                 inputs[key] = cols[i].number_input(KPI_CONFIG[key]['label'], min_value=0.0, step=0.1, format="%.1f")
             else:
                 inputs[key] = cols[i].number_input(KPI_CONFIG[key]['label'], min_value=0, step=1)
         
-        # 5. 綜合 (Score)
         score_item = "綜合指標"
         if score_item in KPI_CONFIG:
             st.markdown("---")
             inputs[score_item] = st.number_input(KPI_CONFIG[score_item]['label'], min_value=0.0, step=0.1)
 
         if st.form_submit_button("🔍 預覽", use_container_width=True):
-            # 組合預覽資料
             preview = {'日期': input_date}
-            # 百分比轉回小數
             for k, v in inputs.items():
                 if KPI_CONFIG[k]['type'] == 'percent':
                     preview[k] = v / 100.0 if v else 0
                 else:
                     preview[k] = v
-            
             st.session_state.preview_data = preview
             st.rerun()
 
     if st.session_state.preview_data:
         st.divider()
         st.write("### 確認上傳資料")
-        # 預覽時把小數轉回百分比顯示比較好看
         disp_df = pd.DataFrame([st.session_state.preview_data]).drop(columns=['日期'])
         st.dataframe(disp_df, hide_index=True)
         
