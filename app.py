@@ -28,14 +28,50 @@ except ImportError:
     st.error("❌ 缺少套件，請在 requirements.txt 加入 `gspread`, `google-auth`, `google-api-python-client`")
     st.stop()
 
+# ==============================================================================
+# ⚙️ 中央參數設定區 (KPI CONFIG) - 未來增減欄位改這裡即可！
+# ==============================================================================
+# 格式： "欄位名稱": {"col": Excel欄位索引(0-based), "type": "類型", "cat": "分類"}
+# Excel 對應：A=0, B=1, C=2 ... I=8, J=9, K=10, L=11 ...
+# ------------------------------------------------------------------------------
+KPI_CONFIG = {
+    # [財務與門號]
+    "毛利":       {"col": 0,  "type": "money",  "cat": "finance", "label": "毛利 ($)"},
+    "門號":       {"col": 1,  "type": "int",    "cat": "finance", "label": "門號 (件)"},
+    "保險營收":   {"col": 2,  "type": "money",  "cat": "finance", "label": "保險營收 ($)"},
+    "配件營收":   {"col": 3,  "type": "money",  "cat": "finance", "label": "配件營收 ($)"},
+    
+    # [硬體銷售] (舊有)
+    "庫存手機":   {"col": 4,  "type": "int",    "cat": "hardware", "label": "庫存手機 (台)"},
+    "蘋果手機":   {"col": 5,  "type": "int",    "cat": "hardware", "label": "蘋果手機 (台)"},
+    "蘋果平板+手錶": {"col": 6, "type": "int",  "cat": "hardware", "label": "蘋果平板/手錶 (台)"},
+    
+    # [重點目標銷售] (I, J, K, L)
+    "華為穿戴":     {"col": 7,  "type": "int",    "cat": "target",   "label": "華為穿戴 (台)"},
+    "橙艾玻璃貼":   {"col": 8,  "type": "int",    "cat": "target",   "label": "橙艾玻璃貼 (張)"},
+    "VIVO銷售目標": {"col": 9,  "type": "int",    "cat": "target",   "label": "VIVO銷售目標 (台)"},
+    "GPLUS吸塵器":  {"col": 10, "type": "int",    "cat": "target",   "label": "GPLUS吸塵器 (台)"},
+
+    # [顧客經營] (Shifted M, N, O, P)
+    "生活圈":       {"col": 11, "type": "int",    "cat": "service",  "label": "生活圈 (人)"},
+    "GOOGLE 評論":  {"col": 12, "type": "int",    "cat": "service",  "label": "Google 評論 (則)"},
+    "來客數":       {"col": 13, "type": "int",    "cat": "service",  "label": "來客數 (人)"},
+
+    # [遠傳專案] (Shifted Q, R, S, T)
+    "遠傳續約":        {"col": 14, "type": "int",    "cat": "project",  "label": "遠傳續約 (件)"},
+    "遠傳續約累積GAP": {"col": 15, "type": "int",    "cat": "project",  "label": "續約累積 GAP"},
+    "遠傳升續率":      {"col": 16, "type": "percent","cat": "project",  "label": "升續率 (%)", "mode": "overwrite"},
+    "遠傳平續率":      {"col": 17, "type": "percent","cat": "project",  "label": "平續率 (%)", "mode": "overwrite"},
+    
+    # [綜合] (U)
+    "綜合指標":        {"col": 18, "type": "float",  "cat": "score",    "label": "綜合指標分數", "mode": "overwrite"}
+}
+
 # --- 2. Google Sheets 連線與工具 ---
 
 @st.cache_resource
 def get_gspread_client():
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive"
-    ]
+    scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
     creds_dict = dict(st.secrets["gcp_service_account"])
     creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
     client = gspread.authorize(creds)
@@ -46,11 +82,9 @@ def check_connection_status():
     try:
         _, _, email = get_gspread_client()
         return True, email
-    except:
-        return False, None
+    except: return False, None
 
 def get_working_folder_id(drive_service, root_folder_id, date_obj):
-    """廣域搜尋月份資料夾"""
     folder_name = date_obj.strftime("%Y%m")
     query = f"name = '{folder_name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
     try:
@@ -94,33 +128,25 @@ def make_columns_unique(columns):
 @st.cache_data(ttl=60)
 def fetch_dynamic_staff_list(store_name, date_obj):
     if store_name == "(ALL) 全店總表": return []
-    
     root_id = st.secrets.get("TARGET_FOLDER_ID")
     client, drive_service, _ = get_gspread_client()
-    
     folder_id = get_working_folder_id(drive_service, root_id, date_obj)
-    
     filename = f"{date_obj.year}_{date_obj.month:02d}_{store_name}業績日報表"
     files = get_sheet_file_info(drive_service, filename, folder_id)
     target_file = next((f for f in files if "google-apps.spreadsheet" in f['mimeType']), None)
-    
     if not target_file: return []
-    
     try:
         sh = client.open_by_key(target_file['id'])
         all_sheets = [ws.title for ws in sh.worksheets()]
         exclude_list = ["總表", "總計", "Total", "TOTAL", "Log", "設定", "Config", store_name]
-        staff_list = [s for s in all_sheets if s not in exclude_list]
-        return staff_list
+        return [s for s in all_sheets if s not in exclude_list]
     except: return []
 
-# --- 讀取與彙整功能 ---
+# --- 讀取與彙整功能 (使用 KPI_CONFIG 自動對應) ---
 
 def scan_and_aggregate_stores(date_obj):
-    """(ALL) 總表彙整"""
     root_id = st.secrets.get("TARGET_FOLDER_ID")
     client, drive_service, _ = get_gspread_client()
-    
     folder_id = get_working_folder_id(drive_service, root_id, date_obj)
     
     try:
@@ -141,16 +167,10 @@ def scan_and_aggregate_stores(date_obj):
         store_name = f['name'].split('_')[-1].replace('業績日報表', '')
         prog_bar.progress(int((idx+1)/len(valid_files)*100), text=f"讀取：{store_name}")
         
-        stat = {
-            "門市": store_name, "連結": f['webViewLink'],
-            "毛利": 0, "門號": 0, "保險營收": 0, "配件營收": 0,
-            "庫存手機": 0, "蘋果手機": 0, "蘋果平板+手錶": 0, 
-            # New Items (I, J, K, L)
-            "華為穿戴": 0, "橙艾玻璃貼": 0, "VIVO銷售目標": 0, "GPLUS吸塵器": 0,
-            # Shifted
-            "生活圈": 0, "GOOGLE 評論": 0, "來客數": 0,
-            "遠傳續約": 0, "遠傳續約累積GAP": 0, "遠傳升續率": 0, "遠傳平續率": 0
-        }
+        # 初始化統計字典
+        stat = {"門市": store_name, "連結": f['webViewLink']}
+        for key in KPI_CONFIG:
+            stat[key] = 0
         
         try:
             sh = client.open_by_key(f['id'])
@@ -161,37 +181,20 @@ def scan_and_aggregate_stores(date_obj):
                 except: pass
             
             if ws:
-                data = ws.get("B15:U45")
+                # 讀取範圍動態判斷：從 B15 到 最後一欄 (目前到 U=20, 讀到 W 保險)
+                data = ws.get("B15:W45")
                 for row in data:
                     if len(row) > 0:
-                        # 0~6
-                        stat["毛利"] += safe_float(row[0]) if len(row)>0 else 0
-                        stat["門號"] += safe_float(row[1]) if len(row)>1 else 0
-                        stat["保險營收"] += safe_float(row[2]) if len(row)>2 else 0
-                        stat["配件營收"] += safe_float(row[3]) if len(row)>3 else 0
-                        stat["庫存手機"] += safe_float(row[4]) if len(row)>4 else 0
-                        stat["蘋果手機"] += safe_float(row[5]) if len(row)>5 else 0
-                        stat["蘋果平板+手錶"] += safe_float(row[6]) if len(row)>6 else 0
-                        
-                        # 7~10 (New)
-                        stat["華為穿戴"] += safe_float(row[7]) if len(row)>7 else 0
-                        stat["橙艾玻璃貼"] += safe_float(row[8]) if len(row)>8 else 0
-                        stat["VIVO銷售目標"] += safe_float(row[9]) if len(row)>9 else 0
-                        stat["GPLUS吸塵器"] += safe_float(row[10]) if len(row)>10 else 0
-                        
-                        # 11~ (Shifted)
-                        stat["生活圈"] += safe_float(row[11]) if len(row)>11 else 0
-                        stat["GOOGLE 評論"] += safe_float(row[12]) if len(row)>12 else 0
-                        stat["來客數"] += safe_float(row[13]) if len(row)>13 else 0
-                        
-                        stat["遠傳續約"] += safe_float(row[14]) if len(row)>14 else 0
-                        v_gap = safe_float(row[15]) if len(row)>15 else 0
-                        v_up = safe_float(row[16]) if len(row)>16 else 0
-                        v_flat = safe_float(row[17]) if len(row)>17 else 0
-                        
-                        if v_gap != 0: stat["遠傳續約累積GAP"] = v_gap
-                        if v_up != 0: stat["遠傳升續率"] = v_up
-                        if v_flat != 0: stat["遠傳平續率"] = v_flat
+                        for key, cfg in KPI_CONFIG.items():
+                            col_idx = cfg['col']
+                            val = safe_float(row[col_idx]) if len(row) > col_idx else 0
+                            
+                            # 如果是覆蓋型 (比率/GAP)，取最後一筆非 0
+                            if cfg.get('mode') == 'overwrite':
+                                if val != 0: stat[key] = val
+                            else:
+                                # 累加型
+                                stat[key] += val
 
         except Exception as e: print(e)
         aggregated_data.append(stat)
@@ -215,23 +218,15 @@ def update_google_sheet_robust(store, staff, date_obj, data_dict):
         ws = sh.worksheet(staff)
         target_row = 15 + (date_obj.day - 1)
         
-        # Col Map (Same as v15.5)
-        col_map = {
-            '毛利': 2, '門號': 3, '保險營收': 4, '配件營收': 5,
-            '庫存手機': 6, '蘋果手機': 7, '蘋果平板+手錶': 8,
-            # New
-            '華為穿戴': 9, '橙艾玻璃貼': 10, 'VIVO銷售目標': 11, 'GPLUS吸塵器': 12,
-            # Shifted
-            '生活圈': 13, 'GOOGLE 評論': 14, '來客數': 15,
-            '遠傳續約': 16, '遠傳續約累積GAP': 17, '遠傳升續率': 18, '遠傳平續率': 19, '綜合指標': 20
-        }
-        overwrite = ['遠傳續約累積GAP', '遠傳升續率', '遠傳平續率', '綜合指標']
-        
         updates = []
         for field, new_val in data_dict.items():
-            if field in col_map and new_val is not None:
-                col_idx = col_map[field]
-                if field in overwrite:
+            if field in KPI_CONFIG and new_val is not None:
+                cfg = KPI_CONFIG[field]
+                # 轉回 Excel 欄位索引 (config 是 0-based，gspread 是 1-based, 但 B 欄是 Start, 所以 col=0 -> B=2)
+                # B欄是第 2 欄，所以 gspread col = config_col + 2
+                col_idx = cfg['col'] + 2
+                
+                if cfg.get('mode') == 'overwrite':
                     updates.append({'range': gspread.utils.rowcol_to_a1(target_row, col_idx), 'values': [[new_val]]})
                 else:
                     old_val = ws.cell(target_row, col_idx).value
@@ -246,13 +241,11 @@ def read_sheet_robust_v13(store, date_obj):
     root_id = st.secrets.get("TARGET_FOLDER_ID")
     client, drive_service, _ = get_gspread_client()
     folder_id = get_working_folder_id(drive_service, root_id, date_obj)
-    
     filename = f"{date_obj.year}_{date_obj.month:02d}_{store}業績日報表"
     files = get_sheet_file_info(drive_service, filename, folder_id)
     target_file = next((f for f in files if "google-apps.spreadsheet" in f['mimeType']), None)
     
     if not target_file: return None, f"找不到檔案：{filename}", None
-    
     try:
         sh = client.open_by_key(target_file['id'])
         target_ws = None
@@ -260,7 +253,6 @@ def read_sheet_robust_v13(store, date_obj):
         except:
             try: target_ws = sh.worksheet("總表")
             except: pass
-            
         if target_ws:
             data = target_ws.get_all_values()
             if len(data) > 1:
@@ -281,7 +273,6 @@ STORE_NAMES = [
 # --- 4. 介面邏輯 ---
 
 st.sidebar.title("🏢 門市導航")
-
 conn_ok, _ = check_connection_status()
 if conn_ok: st.sidebar.success("🟢 系統連線正常", icon="📶")
 else: st.sidebar.error("🔴 系統連線失敗")
@@ -289,8 +280,7 @@ else: st.sidebar.error("🔴 系統連線失敗")
 selected_store = st.sidebar.selectbox("請選擇門市", STORE_NAMES, key="sidebar_store_select")
 
 if selected_store == "(ALL) 全店總表":
-    if 'global_view_date' not in st.session_state:
-        st.session_state.global_view_date = date.today()
+    if 'global_view_date' not in st.session_state: st.session_state.global_view_date = date.today()
     selected_user = "全店總覽"
     staff_options = []
 else:
@@ -298,12 +288,10 @@ else:
     with st.spinner("讀取人員名單..."):
         dynamic_staff = fetch_dynamic_staff_list(selected_store, view_date)
     
-    if dynamic_staff:
-        staff_options = ["該店總表"] + dynamic_staff
+    if dynamic_staff: staff_options = ["該店總表"] + dynamic_staff
     else:
         staff_options = ["該店總表"]
         st.sidebar.caption("⚠️ 尚未建立該月檔案或讀取失敗")
-        
     selected_user = st.sidebar.selectbox("請選擇人員", staff_options, key="sidebar_user_select")
 
 st.sidebar.markdown("---")
@@ -311,10 +299,9 @@ with st.sidebar.expander("⚙️ 系統資訊", expanded=False):
     st.markdown("""
     **馬尼門市業績戰情表**
     © 2025 Money KPI
-    
-    **v15.6 更新說明：**
-    * 全店總表：毛利區塊新增「配件營收」。
-    * 介面重組：新增「重點目標銷售」區塊 (整合庫存、蘋果、華為、橙艾、目標、吸塵器)。
+    **v16.0 旗艦版：**
+    * 架構升級：導入中央參數設定 (KPI_CONFIG)，未來增減欄位只需修改設定區。
+    * 介面美化：全店總表導入分頁 (Tabs) 設計。
     """)
 
 st.title(f"📊 {selected_store} - {selected_user}")
@@ -328,9 +315,7 @@ def check_store_auth(current_store):
              st.session_state.admin_logged_in = True
              st.rerun()
         return False
-    
     if st.session_state.authenticated_store == current_store: return True
-    
     st.info(f"🔒 請輸入【{current_store}】的專屬密碼")
     with st.form("store_login"):
         input_pass = st.text_input("密碼", type="password")
@@ -339,8 +324,7 @@ def check_store_auth(current_store):
             if input_pass == correct_pass:
                 st.session_state.authenticated_store = current_store
                 st.rerun()
-            else:
-                st.error("❌ 密碼錯誤")
+            else: st.error("❌ 密碼錯誤")
     return False
 
 if not check_store_auth(selected_store): st.stop()
@@ -353,82 +337,78 @@ if selected_store == "(ALL) 全店總表":
     st.markdown("### 🏆 全公司業績戰情室")
     view_date = st.date_input("選擇檢視月份", date.today(), key="main_date_input")
     
-    if st.button("🔄 掃描並彙整全店數據", type="primary"):
+    if st.button("🔄 掃描並彙整全店數據", type="primary", use_container_width=True):
         with st.spinner(f"正在掃描 {view_date.strftime('%Y%m')} 資料..."):
             df_all, msg = scan_and_aggregate_stores(view_date)
             if df_all is not None and not df_all.empty:
                 st.success(msg)
+                
+                # --- 頂部關鍵指標 (Key Metrics) ---
+                total_profit = df_all["毛利"].sum()
+                total_cases = df_all["門號"].sum()
+                store_count = len(df_all)
+                
+                m1, m2, m3 = st.columns(3)
+                m1.metric("全店總毛利", f"${total_profit:,.0f}", border=True)
+                m2.metric("全店總門號", f"{total_cases:.0f} 件", border=True)
+                m3.metric("營業門市數", f"{store_count} 間", border=True)
+                
                 st.divider()
-                
-                # 1. 毛利與門號 (新增配件營收)
-                st.subheader("💰 財務與門號")
-                tp = df_all["毛利"].sum(); tc = df_all["門號"].sum(); ti = df_all["保險營收"].sum()
-                ta = df_all["配件營收"].sum() # New metric
-                
-                k1, k2, k3, k4, k5 = st.columns(5) # Changed to 5 columns
-                k1.metric("全店總毛利", f"${tp:,.0f}")
-                k2.metric("全店總門號", f"{tc:.0f} 件")
-                k3.metric("總保險營收", f"${ti:,.0f}")
-                k4.metric("總配件營收", f"${ta:,.0f}") # Added
-                k5.metric("營業門市數", f"{len(df_all)} 間")
-                
-                st.markdown("---")
-                
-                # 2. 重點目標銷售 (整合舊硬體 + 新推廣項目)
-                st.subheader("🎯 重點目標銷售")
-                
-                # Row 1 (4 items)
-                r1c1, r1c2, r1c3, r1c4 = st.columns(4)
-                r1c1.metric("庫存手機", f"{df_all['庫存手機'].sum():.0f} 台")
-                r1c2.metric("蘋果手機", f"{df_all['蘋果手機'].sum():.0f} 台")
-                r1c3.metric("蘋果平板/手錶", f"{df_all['蘋果平板+手錶'].sum():.0f} 台")
-                r1c4.metric("華為穿戴", f"{df_all['華為穿戴'].sum():.0f} 台")
-                
-                # Row 2 (3 items)
-                r2c1, r2c2, r2c3 = st.columns(3)
-                r2c1.metric("橙艾玻璃貼", f"{df_all['橙艾玻璃貼'].sum():.0f} 張")
-                r2c2.metric("VIVO銷售目標", f"{df_all['VIVO銷售目標'].sum():.0f} 台")
-                r2c3.metric("GPLUS吸塵器", f"{df_all['GPLUS吸塵器'].sum():.0f} 台")
 
-                st.markdown("---")
+                # --- 分頁顯示 (Tabs) ---
+                tab1, tab2, tab3, tab4, tab5 = st.tabs([
+                    "💰 財務概況", "🎯 重點目標", "🤝 顧客經營", "📡 遠傳專案", "📋 詳細報表"
+                ])
                 
-                # 3. 顧客經營
-                st.subheader("🤝 顧客經營")
-                s1, s2, s3 = st.columns(3)
-                s1.metric("生活圈", f"{df_all['生活圈'].sum():.0f} 人")
-                s2.metric("Google 評論", f"{df_all['GOOGLE 評論'].sum():.0f} 則")
-                s3.metric("來客數", f"{df_all['來客數'].sum():.0f} 人")
-                
-                st.markdown("---")
-                
-                # 4. 遠傳專案
-                st.subheader("📡 遠傳專案指標")
-                f1, f2, f3, f4 = st.columns(4)
-                f1.metric("遠傳續約", f"{df_all['遠傳續約'].sum():.0f} 件")
-                f2.metric("續約 GAP", f"{df_all['遠傳續約累積GAP'].sum():.0f}")
-                
-                avg_up = df_all[df_all["遠傳升續率"]>0]["遠傳升續率"].mean()
-                f3.metric("升續率", f"{avg_up*100:.1f}%" if not pd.isna(avg_up) else "0%")
-                
-                avg_flat = df_all[df_all["遠傳平續率"]>0]["遠傳平續率"].mean()
-                f4.metric("平續率", f"{avg_flat*100:.1f}%" if not pd.isna(avg_flat) else "0%")
-                
-                st.markdown("---")
-                
-                # 詳細報表
-                st.subheader("📋 詳細分店報表")
-                column_cfg = {
-                    "門市": st.column_config.TextColumn("門市名稱", disabled=True),
-                    "毛利": st.column_config.ProgressColumn("毛利", format="$%d", min_value=0, max_value=int(tp/2) if tp > 0 else 1000),
-                    "連結": st.column_config.LinkColumn("檔案連結", display_text="🔗 開啟")
-                }
-                st.dataframe(df_all, column_config=column_cfg, use_container_width=True, hide_index=True)
+                with tab1:
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("保險營收", f"${df_all['保險營收'].sum():,.0f}")
+                    c2.metric("配件營收", f"${df_all['配件營收'].sum():,.0f}")
+                    # 毛利已在上面顯示，這裡可以放佔比圖或其他
+                    
+                with tab2:
+                    st.caption("含硬體銷售與推廣目標")
+                    # 自動從 CONFIG 取出所有 'hardware' 和 'target' 類別
+                    target_cols = [k for k, v in KPI_CONFIG.items() if v['cat'] in ['hardware', 'target']]
+                    # 4 column grid
+                    cols = st.columns(4)
+                    for i, key in enumerate(target_cols):
+                        with cols[i % 4]:
+                            val = df_all[key].sum()
+                            label = KPI_CONFIG[key]['label']
+                            # 簡化標籤顯示 (去掉單位括號，讓畫面乾淨)
+                            display_label = label.split(" (")[0]
+                            st.metric(display_label, f"{val:,.0f}")
+                            
+                with tab3:
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("生活圈", f"{df_all['生活圈'].sum():.0f}")
+                    c2.metric("Google 評論", f"{df_all['GOOGLE 評論'].sum():.0f}")
+                    c3.metric("來客數", f"{df_all['來客數'].sum():.0f}")
+                    
+                with tab4:
+                    c1, c2, c3, c4 = st.columns(4)
+                    c1.metric("遠傳續約", f"{df_all['遠傳續約'].sum():.0f}")
+                    c2.metric("續約 GAP", f"{df_all['遠傳續約累積GAP'].sum():.0f}")
+                    
+                    avg_up = df_all[df_all["遠傳升續率"]>0]["遠傳升續率"].mean()
+                    c3.metric("升續率", f"{avg_up*100:.1f}%" if not pd.isna(avg_up) else "0%")
+                    
+                    avg_flat = df_all[df_all["遠傳平續率"]>0]["遠傳平續率"].mean()
+                    c4.metric("平續率", f"{avg_flat*100:.1f}%" if not pd.isna(avg_flat) else "0%")
+                    
+                with tab5:
+                    column_cfg = {
+                        "門市": st.column_config.TextColumn("門市名稱", disabled=True),
+                        "毛利": st.column_config.ProgressColumn("毛利", format="$%d", min_value=0, max_value=int(total_profit/2) if total_profit > 0 else 1000),
+                        "連結": st.column_config.LinkColumn("檔案連結", display_text="🔗 開啟")
+                    }
+                    st.dataframe(df_all, column_config=column_cfg, use_container_width=True, hide_index=True)
             else: st.error(msg)
 
 elif selected_user == "該店總表":
     st.markdown("### 📥 門市報表檢視中心")
     st.info(f"目前設定工作月份：**{view_date.strftime('%Y年%m月')}**")
-    
     if st.button(f"📂 讀取 {selected_store} 總表", use_container_width=True):
         with st.spinner("讀取中..."):
             df, fname, link = read_sheet_robust_v13(selected_store, view_date)
@@ -451,64 +431,69 @@ else:
         d_col1, d_col2 = st.columns([1, 3])
         input_date = d_col1.date_input("📅 報表日期", date.today())
         st.markdown("---")
+        
+        # 動態生成表單 (根據 KPI_CONFIG 分類)
+        # 1. 財務 (Finance)
+        st.subheader("💰 財務與門號")
+        fin_items = [k for k,v in KPI_CONFIG.items() if v['cat'] == 'finance']
+        cols = st.columns(len(fin_items))
+        inputs = {}
+        for i, key in enumerate(fin_items):
+            inputs[key] = cols[i].number_input(KPI_CONFIG[key]['label'], min_value=0, step=1 if KPI_CONFIG[key]['type']=='int' else 100)
 
-        st.subheader("💰 毛利與門號")
-        c1, c2, c3, c4 = st.columns(4)
-        in_profit = c1.number_input("毛利 ($)", min_value=0, step=100)
-        in_number = c2.number_input("門號 (件)", min_value=0, step=1)
-        in_insur = c3.number_input("保險營收 ($)", min_value=0, step=100)
-        in_acc = c4.number_input("配件營收 ($)", min_value=0, step=100)
-
-        # [Modified] 重點目標銷售 (整合所有指定項目)
+        # 2. 重點目標銷售 (Hardware + Target)
         st.subheader("🎯 重點目標銷售")
+        tgt_items = [k for k,v in KPI_CONFIG.items() if v['cat'] in ['hardware', 'target']]
+        # Split into rows of 4
+        for i in range(0, len(tgt_items), 4):
+            batch = tgt_items[i:i+4]
+            cols = st.columns(4)
+            for j, key in enumerate(batch):
+                inputs[key] = cols[j].number_input(KPI_CONFIG[key]['label'], min_value=0, step=1)
         
-        # Row 1
-        h1, h2, h3, h4 = st.columns(4)
-        in_stock = h1.number_input("庫存手機 (台)", min_value=0, step=1)
-        in_apple = h2.number_input("蘋果手機 (台)", min_value=0, step=1)
-        in_ipad = h3.number_input("蘋果平板/手錶 (台)", min_value=0, step=1)
-        in_huawei = h4.number_input("華為穿戴 (台)", min_value=0, step=1)
-        
-        # Row 2
-        n1, n2, n3 = st.columns(3)
-        in_orange = n1.number_input("橙艾玻璃貼 (張)", min_value=0, step=1)
-        in_vivo_target = n2.number_input("VIVO銷售目標 (台)", min_value=0, step=1)
-        in_gplus = n3.number_input("GPLUS吸塵器 (台)", min_value=0, step=1)
-
+        # 3. 顧客經營 (Service)
         st.subheader("🤝 顧客經營")
-        s1, s2, s3 = st.columns(3)
-        in_life = s1.number_input("生活圈 (人)", min_value=0, step=1)
-        in_review = s2.number_input("Google 評論 (則)", min_value=0, step=1)
-        in_traffic = s3.number_input("來客數 (人)", min_value=0, step=1)
+        svc_items = [k for k,v in KPI_CONFIG.items() if v['cat'] == 'service']
+        cols = st.columns(len(svc_items))
+        for i, key in enumerate(svc_items):
+            inputs[key] = cols[i].number_input(KPI_CONFIG[key]['label'], min_value=0, step=1)
 
+        # 4. 專案 (Project)
         st.subheader("📡 遠傳專案指標")
-        t1, t2, t3, t4 = st.columns(4)
-        in_renew = t1.number_input("遠傳續約 (件)", min_value=0, step=1)
-        in_gap = t2.number_input("遠傳續約累積 GAP", step=1)
-        in_up = t3.number_input("遠傳升續率 (%)", min_value=0.0, step=0.1)
-        in_flat = t4.number_input("遠傳平續率 (%)", min_value=0.0, step=0.1)
+        prj_items = [k for k,v in KPI_CONFIG.items() if v['cat'] == 'project']
+        cols = st.columns(len(prj_items))
+        for i, key in enumerate(prj_items):
+            # 百分比特殊處理
+            if KPI_CONFIG[key]['type'] == 'percent':
+                inputs[key] = cols[i].number_input(KPI_CONFIG[key]['label'], min_value=0.0, step=0.1, format="%.1f")
+            else:
+                inputs[key] = cols[i].number_input(KPI_CONFIG[key]['label'], min_value=0, step=1)
         
-        in_composite = st.number_input("綜合指標分數", min_value=0.0, step=0.1) 
+        # 5. 綜合 (Score)
+        score_item = "綜合指標"
+        if score_item in KPI_CONFIG:
+            st.markdown("---")
+            inputs[score_item] = st.number_input(KPI_CONFIG[score_item]['label'], min_value=0.0, step=0.1)
 
         if st.form_submit_button("🔍 預覽", use_container_width=True):
-            st.session_state.preview_data = {
-                '毛利': in_profit, '門號': in_number, '保險營收': in_insur, '配件營收': in_acc,
-                # Key Target Sales Group
-                '庫存手機': in_stock, '蘋果手機': in_apple, '蘋果平板+手錶': in_ipad, 
-                '華為穿戴': in_huawei, '橙艾玻璃貼': in_orange, 
-                'VIVO銷售目標': in_vivo_target, 'GPLUS吸塵器': in_gplus,
-                # Others
-                '生活圈': in_life, 'GOOGLE 評論': in_review, '來客數': in_traffic,
-                '遠傳續約': in_renew, '遠傳續約累積GAP': in_gap, 
-                '遠傳升續率': in_up, '遠傳平續率': in_flat,
-                '綜合指標': in_composite, '日期': input_date
-            }
+            # 組合預覽資料
+            preview = {'日期': input_date}
+            # 百分比轉回小數
+            for k, v in inputs.items():
+                if KPI_CONFIG[k]['type'] == 'percent':
+                    preview[k] = v / 100.0 if v else 0
+                else:
+                    preview[k] = v
+            
+            st.session_state.preview_data = preview
             st.rerun()
 
     if st.session_state.preview_data:
         st.divider()
         st.write("### 確認上傳資料")
-        st.dataframe(pd.DataFrame([st.session_state.preview_data]).drop(columns=['日期']), hide_index=True)
+        # 預覽時把小數轉回百分比顯示比較好看
+        disp_df = pd.DataFrame([st.session_state.preview_data]).drop(columns=['日期'])
+        st.dataframe(disp_df, hide_index=True)
         
         c1, c2 = st.columns(2)
         if c1.button("✅ 確認上傳", use_container_width=True, type="primary"):
