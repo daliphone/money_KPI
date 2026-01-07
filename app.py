@@ -89,7 +89,7 @@ def make_columns_unique(columns):
             new_columns.append(col_name)
     return new_columns
 
-# --- 核心邏輯：動態讀取 Excel 分頁作為人員名單 ---
+# --- 核心邏輯：動態讀取 Excel 分頁 ---
 
 @st.cache_data(ttl=60)
 def fetch_dynamic_staff_list(store_name, date_obj):
@@ -114,7 +114,7 @@ def fetch_dynamic_staff_list(store_name, date_obj):
         return staff_list
     except: return []
 
-# --- 讀取與彙整功能 ---
+# --- 讀取與彙整功能 (v15.5 修正欄位) ---
 
 def scan_and_aggregate_stores(date_obj):
     """(ALL) 總表彙整"""
@@ -144,7 +144,10 @@ def scan_and_aggregate_stores(date_obj):
         stat = {
             "門市": store_name, "連結": f['webViewLink'],
             "毛利": 0, "門號": 0, "保險營收": 0, "配件營收": 0,
-            "庫存手機": 0, "蘋果手機": 0, "蘋果平板+手錶": 0, "VIVO手機": 0,
+            "庫存手機": 0, "蘋果手機": 0, "蘋果平板+手錶": 0, 
+            # [v15.5 New Items]
+            "華為穿戴": 0, "橙艾玻璃貼": 0, "VIVO銷售目標": 0, "GPLUS吸塵器": 0,
+            # [Shifted Items] - VIVO手機已移除
             "生活圈": 0, "GOOGLE 評論": 0, "來客數": 0,
             "遠傳續約": 0, "遠傳續約累積GAP": 0, "遠傳升續率": 0, "遠傳平續率": 0
         }
@@ -158,27 +161,39 @@ def scan_and_aggregate_stores(date_obj):
                 except: pass
             
             if ws:
-                data = ws.get("B15:S45")
+                # 讀取範圍至 U (21欄)
+                data = ws.get("B15:U45")
                 for row in data:
                     if len(row) > 0:
+                        # 0~6 固定
                         stat["毛利"] += safe_float(row[0]) if len(row)>0 else 0
                         stat["門號"] += safe_float(row[1]) if len(row)>1 else 0
                         stat["保險營收"] += safe_float(row[2]) if len(row)>2 else 0
                         stat["配件營收"] += safe_float(row[3]) if len(row)>3 else 0
-                        
                         stat["庫存手機"] += safe_float(row[4]) if len(row)>4 else 0
                         stat["蘋果手機"] += safe_float(row[5]) if len(row)>5 else 0
                         stat["蘋果平板+手錶"] += safe_float(row[6]) if len(row)>6 else 0
-                        stat["VIVO手機"] += safe_float(row[7]) if len(row)>7 else 0
                         
-                        stat["生活圈"] += safe_float(row[8]) if len(row)>8 else 0
-                        stat["GOOGLE 評論"] += safe_float(row[9]) if len(row)>9 else 0
-                        stat["來客數"] += safe_float(row[10]) if len(row)>10 else 0
+                        # [v15.5 Mappings]
+                        # I (7) -> 華為穿戴
+                        stat["華為穿戴"] += safe_float(row[7]) if len(row)>7 else 0
+                        # J (8) -> 橙艾玻璃貼
+                        stat["橙艾玻璃貼"] += safe_float(row[8]) if len(row)>8 else 0
+                        # K (9) -> VIVO銷售目標
+                        stat["VIVO銷售目標"] += safe_float(row[9]) if len(row)>9 else 0
+                        # L (10) -> GPLUS吸塵器
+                        stat["GPLUS吸塵器"] += safe_float(row[10]) if len(row)>10 else 0
                         
-                        stat["遠傳續約"] += safe_float(row[11]) if len(row)>11 else 0
-                        v_gap = safe_float(row[12]) if len(row)>12 else 0
-                        v_up = safe_float(row[13]) if len(row)>13 else 0
-                        v_flat = safe_float(row[14]) if len(row)>14 else 0
+                        # [Shifted] M (11) 開始
+                        stat["生活圈"] += safe_float(row[11]) if len(row)>11 else 0
+                        stat["GOOGLE 評論"] += safe_float(row[12]) if len(row)>12 else 0
+                        stat["來客數"] += safe_float(row[13]) if len(row)>13 else 0
+                        
+                        stat["遠傳續約"] += safe_float(row[14]) if len(row)>14 else 0
+                        
+                        v_gap = safe_float(row[15]) if len(row)>15 else 0
+                        v_up = safe_float(row[16]) if len(row)>16 else 0
+                        v_flat = safe_float(row[17]) if len(row)>17 else 0
                         
                         if v_gap != 0: stat["遠傳續約累積GAP"] = v_gap
                         if v_up != 0: stat["遠傳升續率"] = v_up
@@ -206,12 +221,21 @@ def update_google_sheet_robust(store, staff, date_obj, data_dict):
         ws = sh.worksheet(staff)
         target_row = 15 + (date_obj.day - 1)
         
+        # [v15.5 Col Map - VIVO手機 Removed]
         col_map = {
             '毛利': 2, '門號': 3, '保險營收': 4, '配件營收': 5,
-            '庫存手機': 6, '蘋果手機': 7, '蘋果平板+手錶': 8, 'VIVO手機': 9,
-            '生活圈': 10, 'GOOGLE 評論': 11, '來客數': 12,
-            '遠傳續約': 13, 
-            '遠傳續約累積GAP': 14, '遠傳升續率': 15, '遠傳平續率': 16, '綜合指標': 17
+            '庫存手機': 6, '蘋果手機': 7, '蘋果平板+手錶': 8,
+            # New Items (I, J, K, L)
+            '華為穿戴': 9,
+            '橙艾玻璃貼': 10,
+            'VIVO銷售目標': 11,
+            'GPLUS吸塵器': 12,
+            # Shifted Items (M...)
+            '生活圈': 13,
+            'GOOGLE 評論': 14,
+            '來客數': 15,
+            '遠傳續約': 16,
+            '遠傳續約累積GAP': 17, '遠傳升續率': 18, '遠傳平續率': 19, '綜合指標': 20
         }
         overwrite = ['遠傳續約累積GAP', '遠傳升續率', '遠傳平續率', '綜合指標']
         
@@ -233,7 +257,6 @@ def update_google_sheet_robust(store, staff, date_obj, data_dict):
 def read_sheet_robust_v13(store, date_obj):
     root_id = st.secrets.get("TARGET_FOLDER_ID")
     client, drive_service, _ = get_gspread_client()
-    # 這裡會根據 date_obj 去找對應的月份資料夾 (或根目錄)
     folder_id = get_working_folder_id(drive_service, root_id, date_obj)
     
     filename = f"{date_obj.year}_{date_obj.month:02d}_{store}業績日報表"
@@ -286,11 +309,8 @@ if selected_store == "(ALL) 全店總表":
     selected_user = "全店總覽"
     staff_options = []
 else:
-    # 這裡的 view_date 是 Sidebar 的全域設定，會決定讀取哪一個月的資料夾
     view_date = st.sidebar.date_input("設定工作月份", date.today(), key="sidebar_date_picker")
-    
     with st.spinner("讀取人員名單..."):
-        # 動態人員名單也會根據 view_date 去抓對應月份的檔案
         dynamic_staff = fetch_dynamic_staff_list(selected_store, view_date)
     
     if dynamic_staff:
@@ -301,20 +321,16 @@ else:
         
     selected_user = st.sidebar.selectbox("請選擇人員", staff_options, key="sidebar_user_select")
 
-# Footer (系統資訊)
+# Footer
 st.sidebar.markdown("---")
-with st.sidebar.expander("⚙️ 系統資訊 (版本紀錄)", expanded=False):
+with st.sidebar.expander("⚙️ 系統資訊", expanded=False):
     st.markdown("""
     **馬尼門市業績戰情表**
     © 2025 Money KPI
     
-    ---
-    **📜 版本歷程：**
-    * **v15.2 (Current)**：修復「該店總表」月份選擇不同步問題 (移除重複 Date Picker)。
-    * **v15.1**：修復該店總表密碼輸入框遺失問題。
-    * **v15.0**：修正全店總表連結問題、指標分類重組。
-    * **v14.0**：動態讀取人員名單。
-    * **v12.0**：智慧資料夾搜尋。
+    **v15.5 更新說明：**
+    * 欄位更新：移除「VIVO手機」。
+    * 新增項目：華為穿戴、橙艾玻璃貼、VIVO目標、GPLUS吸塵器 (I, J, K, L 欄)。
     """)
 
 st.title(f"📊 {selected_store} - {selected_user}")
@@ -352,12 +368,11 @@ if not check_store_auth(selected_store): st.stop()
 
 if selected_store == "(ALL) 全店總表":
     st.markdown("### 🏆 全公司業績戰情室")
-    # 這裡維持獨立的日期選擇，因為全店總表可能想看跟側邊欄不同的月份
-    view_date_all = st.date_input("選擇檢視月份", date.today(), key="main_date_input")
+    view_date = st.date_input("選擇檢視月份", date.today(), key="main_date_input")
     
     if st.button("🔄 掃描並彙整全店數據", type="primary"):
-        with st.spinner(f"正在掃描 {view_date_all.strftime('%Y%m')} 資料..."):
-            df_all, msg = scan_and_aggregate_stores(view_date_all)
+        with st.spinner(f"正在掃描 {view_date.strftime('%Y%m')} 資料..."):
+            df_all, msg = scan_and_aggregate_stores(view_date)
             if df_all is not None and not df_all.empty:
                 st.success(msg)
                 st.divider()
@@ -373,17 +388,26 @@ if selected_store == "(ALL) 全店總表":
                 
                 st.markdown("---")
                 
-                # 2. 硬體銷售
+                # 2. 硬體銷售 (Updated)
                 st.subheader("📱 硬體銷售")
                 h1, h2, h3, h4 = st.columns(4)
                 h1.metric("庫存手機", f"{df_all['庫存手機'].sum():.0f} 台")
                 h2.metric("蘋果手機", f"{df_all['蘋果手機'].sum():.0f} 台")
                 h3.metric("蘋果平板/手錶", f"{df_all['蘋果平板+手錶'].sum():.0f} 台")
-                h4.metric("VIVO手機", f"{df_all['VIVO手機'].sum():.0f} 台")
+                h4.metric("GPLUS吸塵器", f"{df_all['GPLUS吸塵器'].sum():.0f} 台") # Replaces VIVO Phone
                 
                 st.markdown("---")
                 
-                # 3. 顧客經營
+                # 3. 重點推廣 (New)
+                st.subheader("🔥 重點推廣與目標")
+                p1, p2, p3 = st.columns(3)
+                p1.metric("華為穿戴", f"{df_all['華為穿戴'].sum():.0f} 台")
+                p2.metric("橙艾玻璃貼", f"{df_all['橙艾玻璃貼'].sum():.0f} 張")
+                p3.metric("VIVO銷售目標", f"{df_all['VIVO銷售目標'].sum():.0f} 台")
+
+                st.markdown("---")
+                
+                # 4. 顧客經營
                 st.subheader("🤝 顧客經營")
                 s1, s2, s3 = st.columns(3)
                 s1.metric("生活圈", f"{df_all['生活圈'].sum():.0f} 人")
@@ -392,7 +416,7 @@ if selected_store == "(ALL) 全店總表":
                 
                 st.markdown("---")
                 
-                # 4. 遠傳專案指標
+                # 5. 遠傳專案
                 st.subheader("📡 遠傳專案指標")
                 f1, f2, f3, f4 = st.columns(4)
                 f1.metric("遠傳續約", f"{df_all['遠傳續約'].sum():.0f} 件")
@@ -406,7 +430,7 @@ if selected_store == "(ALL) 全店總表":
                 
                 st.markdown("---")
                 
-                # 5. 詳細報表
+                # 詳細報表
                 st.subheader("📋 詳細分店報表")
                 column_cfg = {
                     "門市": st.column_config.TextColumn("門市名稱", disabled=True),
@@ -418,13 +442,10 @@ if selected_store == "(ALL) 全店總表":
 
 elif selected_user == "該店總表":
     st.markdown("### 📥 門市報表檢視中心")
-    
-    # [Fix v15.2] 移除這裡重複的 date_input，直接顯示 Sidebar 的 view_date
-    st.info(f"目前設定工作月份：**{view_date.strftime('%Y年%m月')}** (如需切換請在左側選擇)")
+    st.info(f"目前設定工作月份：**{view_date.strftime('%Y年%m月')}**")
     
     if st.button(f"📂 讀取 {selected_store} 總表", use_container_width=True):
         with st.spinner("讀取中..."):
-            # 使用 Sidebar 的 view_date，這樣就會去讀取正確的月份資料夾
             df, fname, link = read_sheet_robust_v13(selected_store, view_date)
             if df is not None:
                 st.session_state.current_excel_file = {'df': df, 'name': fname, 'link': link}
@@ -443,8 +464,6 @@ else:
     
     with st.form("daily_input_full"):
         d_col1, d_col2 = st.columns([1, 3])
-        # 這裡的 input_date 預設為今天，但通常使用者填寫業績都是填「當日」或「補昨天的」
-        # 您可以保持預設為 date.today()
         input_date = d_col1.date_input("📅 報表日期", date.today())
         st.markdown("---")
 
@@ -458,9 +477,16 @@ else:
         st.subheader("📱 商品銷售")
         h1, h2, h3, h4 = st.columns(4)
         in_stock = h1.number_input("庫存手機 (台)", min_value=0, step=1)
-        in_vivo = h2.number_input("VIVO 手機 (台)", min_value=0, step=1)
-        in_apple = h3.number_input("蘋果手機 (台)", min_value=0, step=1)
-        in_ipad = h4.number_input("蘋果平板/手錶 (台)", min_value=0, step=1)
+        in_apple = h2.number_input("蘋果手機 (台)", min_value=0, step=1)
+        in_ipad = h3.number_input("蘋果平板/手錶 (台)", min_value=0, step=1)
+        in_gplus = h4.number_input("GPLUS吸塵器 (台)", min_value=0, step=1) # Replaced VIVO Phone
+
+        # [New] 重點推廣區塊 (UI)
+        st.subheader("🔥 重點推廣與目標")
+        n1, n2, n3 = st.columns(3)
+        in_huawei = n1.number_input("華為穿戴 (台)", min_value=0, step=1)
+        in_orange = n2.number_input("橙艾玻璃貼 (張)", min_value=0, step=1)
+        in_vivo_target = n3.number_input("VIVO銷售目標 (台)", min_value=0, step=1)
 
         st.subheader("🤝 顧客經營")
         s1, s2, s3 = st.columns(3)
@@ -480,11 +506,15 @@ else:
         if st.form_submit_button("🔍 預覽", use_container_width=True):
             st.session_state.preview_data = {
                 '毛利': in_profit, '門號': in_number, '保險營收': in_insur, '配件營收': in_acc,
-                '庫存手機': in_stock, '蘋果手機': in_apple, '蘋果平板+手錶': in_ipad, 'VIVO手機': in_vivo,
+                '庫存手機': in_stock, '蘋果手機': in_apple, '蘋果平板+手錶': in_ipad, 
+                # Replaced VIVO Phone with GPLUS in hardware section logic
+                'GPLUS吸塵器': in_gplus,
                 '生活圈': in_life, 'GOOGLE 評論': in_review, '來客數': in_traffic,
                 '遠傳續約': in_renew, '遠傳續約累積GAP': in_gap, 
                 '遠傳升續率': in_up, '遠傳平續率': in_flat,
-                '綜合指標': in_composite, '日期': input_date
+                '綜合指標': in_composite, '日期': input_date,
+                # New items
+                '華為穿戴': in_huawei, '橙艾玻璃貼': in_orange, 'VIVO銷售目標': in_vivo_target
             }
             st.rerun()
 
